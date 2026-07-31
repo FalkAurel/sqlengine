@@ -1,0 +1,10 @@
+[package]
+name = "plinth"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tracing = "0.1.44"
+
+[dev-dependencies]
+shuttle = "0.9.1"
