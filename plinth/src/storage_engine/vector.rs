@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use arrow::array::Array;
+use arrow::array::{Array, ArrowPrimitiveType, PrimitiveArray};
 
 use crate::storage_engine::units::{LogicalOffset, LogicalSize};
 
@@ -12,101 +12,89 @@ pub(crate) const VECTOR_SIZE: LogicalSize = LogicalSize::new(1024);
 /// The concrete array type has already been resolved by `ChunkView`.
 pub struct Vector<'a, A: Array> {
     data: &'a A,
-    offset: LogicalOffset,
-    size: LogicalSize,
+    range: Range<LogicalOffset>,
 }
 
-impl<'a, A: Array> Vector<'a, A> {
-    #[inline]
-    pub(crate) const fn new(data: &'a A, offset: LogicalOffset, size: LogicalSize) -> Self {
-        Self { data, offset, size }
-    }
-
-    #[inline]
-    pub const fn size(&self) -> LogicalSize {
-        self.size
-    }
-
-    #[inline]
-    const fn range(&self) -> Range<LogicalOffset> {
-        self.offset..LogicalOffset::new(self.offset.get() + self.size.get())
-    }
-
+impl<'a, A: Array + sealed::Windowed> Vector<'a, A> {
     pub fn with<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(VectorView<'_, A>) -> R,
+        F: FnOnce(&<A as sealed::Windowed>::Window) -> R,
     {
-        f(VectorView {
-            array: self.data,
-            range: &self.range(),
-        })
-    }
-}
-
-pub struct VectorView<'inner, A: Array> {
-    array: &'inner A,
-    range: &'inner Range<LogicalOffset>,
-}
-
-impl<'inner, A: Array> VectorView<'inner, A> {
-    pub const fn array(&self) -> &A {
-        self.array
-    }
-
-    pub const fn range(&self) -> &Range<LogicalOffset> {
-        self.range
+        f(&self.data.window(&self.range))
     }
 }
 
 /// Produces 1024 element sized logical vectors from a typed chunk.
 pub struct VectorIter<'a, A: Array> {
     data: &'a A,
-    current: usize,
-    size: LogicalSize,
+    current: LogicalOffset,
 }
 
 impl<'a, A: Array> VectorIter<'a, A> {
     #[inline]
-    pub(crate) fn new(data: &'a A, size: LogicalSize) -> Self {
+    pub(crate) fn new(data: &'a A) -> Self {
         Self {
             data,
-            current: 0,
-            size: size,
+            current: LogicalOffset::new(0),
         }
     }
 }
 
-impl<'a, A: Array> Iterator for VectorIter<'a, A> {
+impl<'a, A: Array + sealed::Windowed> Iterator for VectorIter<'a, A> {
     type Item = Vector<'a, A>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current >= self.size.get() as usize {
+        if self.current.get() >= self.data.len() as u64 {
             return None;
         }
 
-        let offset: usize = self.current;
-
-        let end: usize = (offset + VECTOR_SIZE.get() as usize).min(self.size.get() as usize);
+        let start: LogicalOffset = self.current;
+        let end: LogicalOffset =
+            LogicalOffset::new((start + VECTOR_SIZE).get().min(self.data.len() as u64));
 
         self.current = end;
 
-        Some(Vector::new(
-            self.data,
-            LogicalOffset::new(offset as u64),
-            LogicalSize::new((end - offset) as u64),
-        ))
+        Some(Vector {
+            data: self.data,
+            range: start..end,
+        })
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining: usize = self.size.get() as usize - self.current;
+        let remaining: u64 = self.data.len() as u64 - self.current.get();
+        let vector_size: u64 = VECTOR_SIZE.get();
 
-        let vectors: usize =
-            (remaining + VECTOR_SIZE.get() as usize - 1) / VECTOR_SIZE.get() as usize;
+        let vectors: usize = remaining
+            .div_ceil(vector_size)
+            .try_into()
+            .expect("vector count exceeds usize");
 
         (vectors, Some(vectors))
     }
 }
 
-impl<A: Array> ExactSizeIterator for VectorIter<'_, A> {}
+mod sealed {
+    use crate::storage_engine::units::LogicalOffset;
+    use std::ops::Range;
+    pub trait Windowed {
+        type Window: ?Sized;
+
+        fn window(&self, range: &Range<LogicalOffset>) -> &Self::Window;
+    }
+}
+
+impl<T: ArrowPrimitiveType> sealed::Windowed for PrimitiveArray<T> {
+    type Window = [<T as ArrowPrimitiveType>::Native];
+
+    #[inline]
+    fn window(&self, range: &Range<LogicalOffset>) -> &Self::Window {
+        let start: usize = range.start.get() as usize;
+        let end: usize = range.end.get() as usize;
+
+        &self.values()[start..end]
+    }
+}
+
+impl<A: Array + sealed::Windowed> ExactSizeIterator for VectorIter<'_, A> {}
