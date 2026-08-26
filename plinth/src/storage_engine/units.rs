@@ -25,3 +25,17 @@ impl LogicalOffset {
         self.0
     }
 }
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VersionID(u64);
+
+impl VersionID {
+    pub(crate) const fn new(version: u64) -> Self {
+        Self(version)
+    }
+
+    pub(crate) const fn get(&self) -> u64 {
+        self.0
+    }
+}

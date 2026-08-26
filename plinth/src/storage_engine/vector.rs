@@ -10,7 +10,7 @@ pub(crate) const VECTOR_SIZE: LogicalSize = LogicalSize::new(1024);
 ///
 /// There is deliberately no `dyn Array` here.
 /// The concrete array type has already been resolved by `ChunkView`.
-pub(crate) struct Vector<'a, A: Array> {
+pub struct Vector<'a, A: Array> {
     data: &'a A,
     offset: LogicalOffset,
     size: LogicalSize,
@@ -23,31 +23,43 @@ impl<'a, A: Array> Vector<'a, A> {
     }
 
     #[inline]
-    pub const fn array(&self) -> &'a A {
-        self.data
-    }
-
-    #[inline]
-    pub const fn offset(&self) -> LogicalOffset {
-        self.offset
-    }
-
-    #[inline]
     pub const fn size(&self) -> LogicalSize {
         self.size
     }
 
     #[inline]
-    pub const fn range(&self) -> Range<usize> {
-        let start: usize = self.offset.get() as usize;
-        let end: usize = start + self.size.get() as usize;
+    const fn range(&self) -> Range<LogicalOffset> {
+        self.offset..LogicalOffset::new(self.offset.get() + self.size.get())
+    }
 
-        start..end
+    pub fn with<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(VectorView<'_, A>) -> R,
+    {
+        f(VectorView {
+            array: self.data,
+            range: &self.range(),
+        })
     }
 }
 
-/// Produces ~1 KiB logical vectors from a typed 64K chunk.
-pub(crate) struct VectorIter<'a, A: Array> {
+pub struct VectorView<'inner, A: Array> {
+    array: &'inner A,
+    range: &'inner Range<LogicalOffset>,
+}
+
+impl<'inner, A: Array> VectorView<'inner, A> {
+    pub const fn array(&self) -> &A {
+        self.array
+    }
+
+    pub const fn range(&self) -> &Range<LogicalOffset> {
+        self.range
+    }
+}
+
+/// Produces 1024 element sized logical vectors from a typed chunk.
+pub struct VectorIter<'a, A: Array> {
     data: &'a A,
     current: usize,
     size: LogicalSize,

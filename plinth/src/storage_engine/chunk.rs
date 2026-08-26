@@ -1,18 +1,27 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
-use arrow::array::Array;
+use arrow::array::{Array, ArrayBuilder, ArrowPrimitiveType, BooleanBufferBuilder, PrimitiveBuilder};
 
-use crate::storage_engine::{units::LogicalSize, vector::VectorIter};
+use crate::storage_engine::{
+    units::{LogicalSize, VersionID},
+    vector::VectorIter,
+};
+
+const CHUNK_SIZE: LogicalSize = LogicalSize::new(1024 * 64);
 
 pub(crate) struct FrozenChunk {
     array: Box<dyn Array>,
-    chunk_id: u64,
+    chunk_id: VersionID,
     logical_size: LogicalSize,
     next: OnceLock<Arc<FrozenChunk>>,
 }
 
 impl FrozenChunk {
-    pub(crate) fn new(array: Box<dyn Array>, chunk_id: u64, logical_size: LogicalSize) -> Self {
+    pub(crate) fn new(
+        array: Box<dyn Array>,
+        chunk_id: VersionID,
+        logical_size: LogicalSize,
+    ) -> Self {
         Self {
             array,
             chunk_id,
@@ -21,10 +30,10 @@ impl FrozenChunk {
         }
     }
 
-    /// Type-erased -> typed transition.
+    /// Creates a typed view over the type-erased array.
     ///
-    /// This is intentionally done once before vectorization,
-    /// rather than once per Vector.
+    /// The downcast is performed once, before vectorization, rather than
+    /// repeatedly for each vector.
     pub(crate) fn view<A: Array + 'static>(&self) -> Option<ChunkView<'_, A>> {
         let array: &A = self.array.as_any().downcast_ref::<A>()?;
 
@@ -34,7 +43,7 @@ impl FrozenChunk {
         })
     }
 
-    pub(crate) fn chunk_id(&self) -> u64 {
+    pub(crate) fn chunk_id(&self) -> VersionID {
         self.chunk_id
     }
 
@@ -47,10 +56,10 @@ impl FrozenChunk {
     }
 }
 
-/// A typed view of a frozen chunk.
+/// A typed view over a frozen chunk.
 ///
-/// The downcast from `dyn Array` to `A` has already happened
-/// before this object is created.
+/// The underlying `dyn Array` has already been downcast to `A` before
+/// this view is created.
 pub(crate) struct ChunkView<'a, A: Array> {
     array: &'a A,
     logical_size: LogicalSize,
@@ -73,31 +82,103 @@ impl<'a, A: Array> ChunkView<'a, A> {
     }
 }
 
-/// The mutable chunk should normally be generic over its concrete builder.
-///
-/// This avoids a downcast on every insertion.
-pub(crate) struct MutableChunk<B> {
-    builder: B,
-    chunk_id: u64,
+pub(crate) struct MutableChunk {
+    builder: Box<dyn ArrayBuilder>,
+    chunk_id: VersionID,
 }
 
-impl<B> MutableChunk<B> {
-    pub(crate) fn new(builder: B, chunk_id: u64) -> Self {
+impl MutableChunk {
+    pub(crate) fn new(builder: Box<dyn ArrayBuilder>, chunk_id: VersionID) -> Self {
         Self { builder, chunk_id }
     }
 
-    #[inline]
-    pub(crate) fn builder(&self) -> &B {
-        &self.builder
-    }
+    fn builder<B: ArrayBuilder + Append>(self) -> Result<ChunkWriter<B>, Self> {
+        if self.builder.as_any().is::<B>() {
+            // Check the type before consuming the type-erased builder so that
+            // we can safely recover the concrete builder below.
+            let builder: Box<B> = self
+                .builder
+                .into_box_any()
+                .downcast::<B>()
+                .expect("See above. Invariant is upheld");
 
-    #[inline]
-    pub(crate) fn builder_mut(&mut self) -> &mut B {
-        &mut self.builder
+            Ok(ChunkWriter {
+                builder,
+                chunk_id: self.chunk_id,
+            })
+        } else {
+            Err(self)
+        }
     }
+}
 
-    #[inline]
-    pub(crate) fn chunk_id(&self) -> u64 {
-        self.chunk_id
+pub(crate) struct ChunkWriter<B: ArrayBuilder + Append> {
+    builder: Box<B>,
+    chunk_id: VersionID,
+}
+
+impl<B: ArrayBuilder + Append> ChunkWriter<B> {
+    /// Appends a value to the chunk if it has not reached `CHUNK_SIZE`.
+    ///
+    /// Consuming `self` makes the chunk writer a state transition:
+    /// once the chunk is full, `append` returns `None` and the writer
+    /// can no longer be used to append additional values.
+    ///
+    /// This guarantees a uniform chunk size and prevents appending
+    /// beyond the configured capacity.
+    pub fn append(mut self, value: <B as Append>::Element) -> Option<Self> {
+        if self.builder.len() < CHUNK_SIZE.get() as usize {
+            self.builder.append(value);
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
+pub trait Append {
+    type Element;
+    fn append(&mut self, value: Self::Element);
+}
+
+impl<T: ArrowPrimitiveType> Append for PrimitiveBuilder<T> {
+    type Element = <T as ArrowPrimitiveType>::Native;
+    fn append(&mut self, value: Self::Element) {
+        self.append_value(value);
+    }
+}
+
+impl Append for BooleanBufferBuilder {
+    type Element = bool;
+    fn append(&mut self, value: Self::Element) {
+        self.append(value);
+    }
+}
+
+
+
+#[cfg(test)]
+mod test {
+    use arrow::array::{ArrayBuilder, Float32Builder};
+
+    use crate::storage_engine::{
+        chunk::{CHUNK_SIZE, MutableChunk},
+        units::VersionID,
+    };
+
+    #[test]
+    fn append_values() {
+        let float_builder: Box<dyn ArrayBuilder> = Box::new(Float32Builder::new());
+        let mutable_chunk: MutableChunk = MutableChunk::new(float_builder, VersionID::new(0));
+
+        if let Ok(mut chunk_writer) = mutable_chunk.builder::<Float32Builder>() {
+            for value in 0..CHUNK_SIZE.get() {
+                chunk_writer = chunk_writer.append(value as f32).unwrap();
+            }
+
+            assert!(chunk_writer.append(1.0).is_none());
+        } else {
+            assert!(false);
+        }
     }
 }
