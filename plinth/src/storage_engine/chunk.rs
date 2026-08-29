@@ -1,6 +1,8 @@
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 
-use arrow::array::{Array, ArrayBuilder, ArrowPrimitiveType, BooleanBufferBuilder, PrimitiveBuilder};
+use arrow::array::{
+    Array, ArrayBuilder, ArrowPrimitiveType, BooleanBufferBuilder, PrimitiveBuilder,
+};
 
 use crate::storage_engine::{
     units::{LogicalSize, VersionID},
@@ -9,23 +11,18 @@ use crate::storage_engine::{
 
 const CHUNK_SIZE: LogicalSize = LogicalSize::new(1024 * 64);
 
+#[derive(Debug)]
 pub(crate) struct FrozenChunk {
-    array: Box<dyn Array>,
+    array: Arc<dyn Array>,
     chunk_id: VersionID,
-    logical_size: LogicalSize,
     next: OnceLock<Arc<FrozenChunk>>,
 }
 
 impl FrozenChunk {
-    pub(crate) fn new(
-        array: Box<dyn Array>,
-        chunk_id: VersionID,
-        logical_size: LogicalSize,
-    ) -> Self {
+    pub(crate) fn new(array: Arc<dyn Array>, chunk_id: VersionID) -> Self {
         Self {
             array,
             chunk_id,
-            logical_size,
             next: OnceLock::new(),
         }
     }
@@ -39,7 +36,7 @@ impl FrozenChunk {
 
         Some(ChunkView {
             array,
-            logical_size: self.logical_size,
+            logical_size: CHUNK_SIZE,
         })
     }
 
@@ -47,12 +44,12 @@ impl FrozenChunk {
         self.chunk_id
     }
 
-    pub(crate) fn logical_size(&self) -> LogicalSize {
-        self.logical_size
-    }
-
     pub(crate) fn next(&self) -> Option<&Arc<FrozenChunk>> {
         self.next.get()
+    }
+
+    pub(crate) fn set_next(&self, value: Arc<FrozenChunk>) -> Result<(), Arc<FrozenChunk>> {
+        self.next.set(value)
     }
 }
 
@@ -78,84 +75,130 @@ impl<'a, A: Array> ChunkView<'a, A> {
 
     #[inline]
     pub(crate) fn vectors(&self) -> VectorIter<'a, A> {
-        VectorIter::new(self.array, self.logical_size)
+        VectorIter::new(self.array)
     }
 }
 
 pub(crate) struct MutableChunk {
-    builder: Box<dyn ArrayBuilder>,
+    builder: Option<Box<dyn ArrayBuilder>>,
     chunk_id: VersionID,
 }
 
 impl MutableChunk {
-    pub(crate) fn new(builder: Box<dyn ArrayBuilder>, chunk_id: VersionID) -> Self {
-        Self { builder, chunk_id }
+    pub(crate) const fn new(builder: Box<dyn ArrayBuilder>, chunk_id: VersionID) -> Self {
+        Self {
+            builder: Some(builder),
+            chunk_id,
+        }
     }
 
-    fn builder<B: ArrayBuilder + Append>(self) -> Result<ChunkWriter<B>, Self> {
-        if self.builder.as_any().is::<B>() {
+    pub(crate) fn builder<B: ArrayBuilder + sealed::Append + Send>(
+        mut self,
+    ) -> Result<ChunkWriter<B>, Self> {
+        let builder: &Box<dyn ArrayBuilder> = self
+            .builder
+            .as_ref()
+            .expect("MutableChunk builder must be present before type resolution");
+
+        if builder.as_any().is::<B>() {
             // Check the type before consuming the type-erased builder so that
             // we can safely recover the concrete builder below.
             let builder: Box<B> = self
                 .builder
+                .take()
+                .expect("MutableChunk builder must be present after successful type check")
                 .into_box_any()
                 .downcast::<B>()
-                .expect("See above. Invariant is upheld");
+                .expect("builder type must match the type checked above");
 
             Ok(ChunkWriter {
-                builder,
+                builder: Some(builder),
                 chunk_id: self.chunk_id,
             })
         } else {
             Err(self)
         }
     }
-}
 
-pub(crate) struct ChunkWriter<B: ArrayBuilder + Append> {
-    builder: Box<B>,
-    chunk_id: VersionID,
-}
-
-impl<B: ArrayBuilder + Append> ChunkWriter<B> {
-    /// Appends a value to the chunk if it has not reached `CHUNK_SIZE`.
-    ///
-    /// Consuming `self` makes the chunk writer a state transition:
-    /// once the chunk is full, `append` returns `None` and the writer
-    /// can no longer be used to append additional values.
-    ///
-    /// This guarantees a uniform chunk size and prevents appending
-    /// beyond the configured capacity.
-    pub fn append(mut self, value: <B as Append>::Element) -> Option<Self> {
-        if self.builder.len() < CHUNK_SIZE.get() as usize {
-            self.builder.append(value);
-            Some(self)
-        } else {
-            None
+    pub(crate) fn from<B: ArrayBuilder + sealed::Append + Send>(
+        mut writer: ChunkWriter<B>,
+    ) -> Self {
+        Self {
+            builder: Some(
+                writer
+                    .builder
+                    .take()
+                    .expect("ChunkWriter builder must be present when converting to MutableChunk"),
+            ),
+            chunk_id: writer.chunk_id,
         }
     }
 }
 
-pub trait Append {
-    type Element;
-    fn append(&mut self, value: Self::Element);
+pub(crate) struct ChunkWriter<B: ArrayBuilder + sealed::Append + Send> {
+    builder: Option<Box<B>>,
+    chunk_id: VersionID,
 }
 
-impl<T: ArrowPrimitiveType> Append for PrimitiveBuilder<T> {
+impl<B: ArrayBuilder + sealed::Append> ChunkWriter<B> {
+    #[inline]
+    fn builder_ref(&self) -> &B {
+        self.builder
+            .as_deref()
+            .expect("ChunkWriter builder must be present")
+    }
+
+    #[inline]
+    fn builder_mut(&mut self) -> &mut B {
+        self.builder
+            .as_deref_mut()
+            .expect("ChunkWriter builder must be present")
+    }
+
+    /// Appends a value to the chunk if it has not reached `CHUNK_SIZE`.
+    ///
+    /// Consuming `self` makes the chunk writer a state transition:
+    /// once the chunk is full, `append` returns the builder and the writer
+    /// can no longer be used to append additional values.
+    ///
+    /// This guarantees a uniform chunk size and prevents appending
+    /// beyond the configured capacity.
+    pub fn append(mut self, value: B::Element) -> Result<Self, (Box<B>, VersionID)> {
+        if self.builder_ref().len() < CHUNK_SIZE.get() as usize {
+            self.builder_mut().append(value);
+            Ok(self)
+        } else {
+            let builder: Box<B> = self
+                .builder
+                .take()
+                .expect("ChunkWriter builder must be present when chunk is full");
+
+            Err((builder, self.chunk_id))
+        }
+    }
+}
+
+pub(crate) use sealed::Append;
+mod sealed {
+    pub(crate) trait Append {
+        type Element;
+        fn append(&mut self, value: Self::Element);
+    }
+}
+
+impl<T: ArrowPrimitiveType> sealed::Append for PrimitiveBuilder<T> {
     type Element = <T as ArrowPrimitiveType>::Native;
     fn append(&mut self, value: Self::Element) {
         self.append_value(value);
     }
 }
 
-impl Append for BooleanBufferBuilder {
+impl sealed::Append for BooleanBufferBuilder {
     type Element = bool;
     fn append(&mut self, value: Self::Element) {
         self.append(value);
     }
 }
-
-
 
 #[cfg(test)]
 mod test {
@@ -176,7 +219,7 @@ mod test {
                 chunk_writer = chunk_writer.append(value as f32).unwrap();
             }
 
-            assert!(chunk_writer.append(1.0).is_none());
+            assert!(chunk_writer.append(1.0).is_err());
         } else {
             assert!(false);
         }
