@@ -35,8 +35,15 @@ impl Add<LogicalSize> for LogicalOffset {
     }
 }
 
+impl Add<LogicalOffset> for LogicalOffset {
+    type Output = Self;
+    fn add(self, rhs: LogicalOffset) -> Self::Output {
+        LogicalOffset::new(self.0 + rhs.0)
+    }
+}
+
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VersionID(u64);
 
 impl VersionID {

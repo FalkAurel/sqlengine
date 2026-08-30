@@ -2,7 +2,10 @@ use std::ops::Range;
 
 use arrow::array::{Array, ArrowPrimitiveType, PrimitiveArray};
 
-use crate::storage_engine::units::{LogicalOffset, LogicalSize};
+use crate::storage_engine::{
+    units::{LogicalOffset, LogicalSize},
+    vector::sealed::Windowed,
+};
 
 pub(crate) const VECTOR_SIZE: LogicalSize = LogicalSize::new(1024);
 
@@ -15,12 +18,30 @@ pub struct Vector<'a, A: Array> {
     range: Range<LogicalOffset>,
 }
 
+pub struct Validity<'a, A: Array> {
+    data: &'a A,
+    base: LogicalOffset,
+}
+
+impl<'a, A: Windowed> Validity<'a, A> {
+    #[inline]
+    pub fn is_valid(&self, offset: LogicalOffset) -> bool {
+        Windowed::is_valid(self.data, self.base + offset)
+    }
+}
+
 impl<'a, A: Array + sealed::Windowed> Vector<'a, A> {
     pub fn with<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&<A as sealed::Windowed>::Window) -> R,
+        F: FnOnce(&<A as sealed::Windowed>::Window, Validity<'_, A>) -> R,
     {
-        f(&self.data.window(&self.range))
+        f(
+            &self.data.window(&self.range),
+            Validity {
+                data: self.data,
+                base: self.range.start,
+            },
+        )
     }
 }
 
@@ -76,12 +97,17 @@ impl<'a, A: Array + sealed::Windowed> Iterator for VectorIter<'a, A> {
 }
 
 mod sealed {
+    use arrow::array::Array;
+
     use crate::storage_engine::units::LogicalOffset;
     use std::ops::Range;
-    pub trait Windowed {
+    pub trait Windowed: Array {
         type Window: ?Sized;
 
         fn window(&self, range: &Range<LogicalOffset>) -> &Self::Window;
+        fn is_valid(&self, index: LogicalOffset) -> bool {
+            Array::is_valid(self, index.get() as usize)
+        }
     }
 }
 

@@ -1,8 +1,9 @@
-use std::sync::{Arc, OnceLock};
-
-use arrow::array::{
-    Array, ArrayBuilder, ArrowPrimitiveType, BooleanBufferBuilder, PrimitiveBuilder,
+use std::{
+    fmt::Debug,
+    sync::{Arc, OnceLock},
 };
+
+use arrow::array::{Array, ArrayBuilder, ArrowPrimitiveType, BooleanBuilder, PrimitiveBuilder};
 
 use crate::storage_engine::{
     units::{LogicalSize, VersionID},
@@ -155,17 +156,31 @@ impl<B: ArrayBuilder + sealed::Append> ChunkWriter<B> {
             .expect("ChunkWriter builder must be present")
     }
 
-    /// Appends a value to the chunk if it has not reached `CHUNK_SIZE`.
+    /// Appends a value to the chunk, consuming the value before checking
+    /// whether the chunk has reached `CHUNK_SIZE`.
     ///
-    /// Consuming `self` makes the chunk writer a state transition:
-    /// once the chunk is full, `append` returns the builder and the writer
-    /// can no longer be used to append additional values.
+    /// Consuming `self` makes the chunk writer a state transition. The value
+    /// is always inserted when the writer has capacity. If this insertion
+    /// fills the chunk, `append` returns the completed builder together with
+    /// its chunk ID instead of returning the writer.
     ///
-    /// This guarantees a uniform chunk size and prevents appending
-    /// beyond the configured capacity.
+    /// This ordering is important: checking whether the chunk has room for
+    /// the value *before* inserting it would require the value to be retained
+    /// so it could be inserted later. That would either require `B::Element`
+    /// to implement `Clone`/`Copy` or risk losing a non-cloneable value when
+    /// the chunk becomes full.
+    ///
+    /// Therefore, callers can rely on the invariant that every value passed
+    /// to `append` is inserted exactly once, and `Err` means that the
+    /// insertion just completed the chunk.
     pub fn append(mut self, value: B::Element) -> Result<Self, (Box<B>, VersionID)> {
+        assert!(
+            self.builder_ref().len() < CHUNK_SIZE.get() as usize,
+            "State Machine should never enter a state where we have a full buffer but keep writing to it."
+        );
+        self.builder_mut().append(value);
+
         if self.builder_ref().len() < CHUNK_SIZE.get() as usize {
-            self.builder_mut().append(value);
             Ok(self)
         } else {
             let builder: Box<B> = self
@@ -193,35 +208,329 @@ impl<T: ArrowPrimitiveType> sealed::Append for PrimitiveBuilder<T> {
     }
 }
 
-impl sealed::Append for BooleanBufferBuilder {
+impl sealed::Append for BooleanBuilder {
     type Element = bool;
     fn append(&mut self, value: Self::Element) {
-        self.append(value);
+        BooleanBuilder::append_value(self, value);
     }
 }
 
 #[cfg(test)]
 mod test {
-    use arrow::array::{ArrayBuilder, Float32Builder};
+    use std::sync::Arc;
+
+    use arrow::array::{
+        Array, ArrayBuilder, BooleanBuilder, Float32Array, Float32Builder, Int64Array, Int64Builder,
+    };
 
     use crate::storage_engine::{
-        chunk::{CHUNK_SIZE, MutableChunk},
-        units::VersionID,
+        chunk::{Append, CHUNK_SIZE, ChunkWriter, FrozenChunk, MutableChunk},
+        units::{LogicalOffset, VersionID},
     };
+
+    fn unwrap_builder<B: ArrayBuilder + Append + Send>(chunk: MutableChunk) -> ChunkWriter<B> {
+        match chunk.builder::<B>() {
+            Ok(writer) => writer,
+            Err(_) => panic!("builder type resolution failed"),
+        }
+    }
 
     #[test]
     fn append_values() {
-        let float_builder: Box<dyn ArrayBuilder> = Box::new(Float32Builder::new());
-        let mutable_chunk: MutableChunk = MutableChunk::new(float_builder, VersionID::new(0));
+        let builder: Box<dyn ArrayBuilder> = Box::new(Float32Builder::new());
+        let mutable_chunk = MutableChunk::new(builder, VersionID::new(0));
 
-        if let Ok(mut chunk_writer) = mutable_chunk.builder::<Float32Builder>() {
-            for value in 0..CHUNK_SIZE.get() {
-                chunk_writer = chunk_writer.append(value as f32).unwrap();
-            }
+        let mut writer = unwrap_builder::<Float32Builder>(mutable_chunk);
 
-            assert!(chunk_writer.append(1.0).is_err());
-        } else {
-            assert!(false);
+        for value in 0..CHUNK_SIZE.get() - 1 {
+            writer = writer
+                .append(value as f32)
+                .expect("chunk should not be full yet");
         }
+
+        let result = writer.append(CHUNK_SIZE.get() as f32 - 1.0);
+
+        assert!(
+            result.is_err(),
+            "the append filling the chunk must return the completed builder"
+        );
+
+        let (builder, version_id) = match result {
+            Err(values) => values,
+            Ok(_) => panic!("State Machine in invalid state"),
+        };
+
+        assert_eq!(version_id, VersionID::new(0));
+        assert_eq!(builder.len(), CHUNK_SIZE.get() as usize);
+    }
+
+    #[test]
+    fn append_fills_exactly_one_chunk() {
+        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let mutable_chunk = MutableChunk::new(builder, VersionID::new(42));
+
+        let mut writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+
+        for value in 0..CHUNK_SIZE.get() - 1 {
+            writer = writer
+                .append(value as i64)
+                .expect("chunk should have capacity");
+        }
+
+        let (builder, version_id) = match writer.append((CHUNK_SIZE.get() - 1) as i64) {
+            Ok(_) => panic!("the final value should complete the chunk"),
+            Err(values) => values,
+        };
+
+        assert_eq!(version_id, VersionID::new(42));
+        assert_eq!(builder.len(), CHUNK_SIZE.get() as usize);
+    }
+
+    #[test]
+    fn builder_type_resolution_succeeds_for_matching_type() {
+        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let mutable_chunk = MutableChunk::new(builder, VersionID::new(7));
+
+        let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+
+        assert_eq!(writer.builder_ref().len(), 0);
+    }
+
+    #[test]
+    fn builder_type_resolution_fails_for_wrong_type() {
+        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let mutable_chunk = MutableChunk::new(builder, VersionID::new(7));
+
+        let result = mutable_chunk.builder::<Float32Builder>();
+
+        assert!(
+            result.is_err(),
+            "resolving an Int64Builder as Float32Builder must fail"
+        );
+
+        let mutable_chunk = match result {
+            Ok(_) => panic!("Type resolution should have failed"),
+            Err(chunk) => chunk,
+        };
+
+        // The original builder must still be available after a failed
+        // type resolution.
+        let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+
+        assert_eq!(writer.builder_ref().len(), 0);
+    }
+
+    #[test]
+    fn mutable_chunk_round_trip_preserves_builder() {
+        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let mutable_chunk = MutableChunk::new(builder, VersionID::new(123));
+
+        let mut writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+
+        writer = writer.append(10).unwrap();
+        writer = writer.append(20).unwrap();
+        writer = writer.append(30).unwrap();
+
+        let mutable_chunk = MutableChunk::from(writer);
+        let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+
+        assert_eq!(writer.builder_ref().len(), 3);
+    }
+
+    #[test]
+    fn frozen_chunk_exposes_chunk_id() {
+        let array: Arc<dyn Array> = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let chunk = FrozenChunk::new(array, VersionID::new(99));
+
+        assert_eq!(chunk.chunk_id(), VersionID::new(99));
+    }
+
+    #[test]
+    fn frozen_chunk_view_downcasts_correct_type() {
+        let array: Arc<dyn Array> = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let chunk = FrozenChunk::new(array, VersionID::new(0));
+
+        let view = chunk
+            .view::<Int64Array>()
+            .expect("Int64Array downcast should succeed");
+
+        assert_eq!(view.array().len(), 3);
+    }
+
+    #[test]
+    fn frozen_chunk_view_rejects_wrong_type() {
+        let array: Arc<dyn Array> = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let chunk = FrozenChunk::new(array, VersionID::new(0));
+
+        assert!(
+            chunk.view::<Float32Array>().is_none(),
+            "view should reject an incompatible array type"
+        );
+    }
+
+    #[test]
+    fn frozen_chunk_next_is_initially_empty() {
+        let array: Arc<dyn Array> = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let chunk = FrozenChunk::new(array, VersionID::new(0));
+
+        assert!(chunk.next().is_none());
+    }
+
+    #[test]
+    fn frozen_chunk_next_can_only_be_set_once() {
+        let first = Arc::new(FrozenChunk::new(
+            Arc::new(Int64Array::from(vec![1])),
+            VersionID::new(1),
+        ));
+
+        let second = Arc::new(FrozenChunk::new(
+            Arc::new(Int64Array::from(vec![2])),
+            VersionID::new(2),
+        ));
+
+        let third = Arc::new(FrozenChunk::new(
+            Arc::new(Int64Array::from(vec![3])),
+            VersionID::new(3),
+        ));
+
+        assert!(first.set_next(second.clone()).is_ok());
+
+        let result = first.set_next(third);
+
+        assert!(
+            result.is_err(),
+            "FrozenChunk::next must only be initialized once"
+        );
+
+        assert_eq!(
+            first
+                .next()
+                .expect("next should have been initialized")
+                .chunk_id(),
+            VersionID::new(2)
+        );
+    }
+
+    #[test]
+    fn frozen_chunk_next_forms_chain() {
+        let first = Arc::new(FrozenChunk::new(
+            Arc::new(Int64Array::from(vec![1])),
+            VersionID::new(1),
+        ));
+
+        let second = Arc::new(FrozenChunk::new(
+            Arc::new(Int64Array::from(vec![2])),
+            VersionID::new(2),
+        ));
+
+        let third = Arc::new(FrozenChunk::new(
+            Arc::new(Int64Array::from(vec![3])),
+            VersionID::new(3),
+        ));
+
+        first
+            .set_next(second.clone())
+            .expect("first next should be empty");
+
+        second.set_next(third).expect("second next should be empty");
+
+        assert_eq!(first.next().unwrap().chunk_id(), VersionID::new(2));
+
+        assert_eq!(
+            first.next().unwrap().next().unwrap().chunk_id(),
+            VersionID::new(3)
+        );
+
+        assert!(first.next().unwrap().next().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn read_values() {
+        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let mutable_chunk = MutableChunk::new(builder, VersionID::new(0));
+
+        let mut chunk_writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+
+        for value in 0..CHUNK_SIZE.get() - 1 {
+            chunk_writer = chunk_writer.append(value as i64).unwrap();
+        }
+
+        let (mut builder, version_id) = match chunk_writer.append(CHUNK_SIZE.get() as i64 - 1) {
+            Ok(_) => panic!("final append should freeze the chunk"),
+            Err(values) => values,
+        };
+        let array: Arc<dyn Array + 'static> = Arc::new(builder.finish());
+        let frozen_chunk = FrozenChunk::new(array, version_id);
+
+        let view = frozen_chunk
+            .view::<Int64Array>()
+            .expect("downcast should succeed");
+
+        assert_eq!(view.array().len(), CHUNK_SIZE.get() as usize);
+
+        let mut cum_sum = 0i64;
+
+        for vector in view.vectors() {
+            let sum: i64 = vector.with(|window, validity| {
+                let mut sum = 0i64;
+
+                for (index, element) in window.iter().enumerate() {
+                    assert!(
+                        validity.is_valid(LogicalOffset::new(index as u64)),
+                        "all values in this test should be valid"
+                    );
+
+                    sum += *element;
+                }
+
+                sum
+            });
+
+            cum_sum += sum;
+        }
+
+        let n = CHUNK_SIZE.get() as i64 - 1;
+
+        assert_eq!(cum_sum, n * (n + 1) / 2);
+    }
+
+    #[test]
+    fn boolean_builder_resolves_and_appends() {
+        let builder: Box<dyn ArrayBuilder> = Box::new(BooleanBuilder::new());
+        let mutable_chunk = MutableChunk::new(builder, VersionID::new(0));
+
+        let mut writer = unwrap_builder::<BooleanBuilder>(mutable_chunk);
+
+        writer = writer.append(true).unwrap();
+        writer = writer.append(false).unwrap();
+        writer = writer.append(true).unwrap();
+
+        assert_eq!(writer.builder_ref().len(), 3);
+    }
+
+    #[test]
+    fn chunk_id_survives_mutable_to_frozen_transition() {
+        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let mutable_chunk = MutableChunk::new(builder, VersionID::new(1234));
+
+        let mut writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+
+        for value in 0..CHUNK_SIZE.get() - 1 {
+            writer = writer.append(value as i64).unwrap();
+        }
+
+        let (mut builder, version_id) = match writer.append((CHUNK_SIZE.get() - 1) as i64) {
+            Ok(_) => panic!("final append should complete the chunk"),
+            Err(values) => values,
+        };
+
+        let array: Arc<dyn Array> = Arc::new(builder.finish());
+        let frozen = FrozenChunk::new(array, version_id);
+
+        assert_eq!(frozen.chunk_id(), VersionID::new(1234));
+        assert_eq!(
+            frozen.view::<Int64Array>().unwrap().array().len(),
+            CHUNK_SIZE.get() as usize
+        );
     }
 }
