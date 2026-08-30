@@ -10,7 +10,7 @@ use crate::storage_engine::{
     vector::VectorIter,
 };
 
-const CHUNK_SIZE: LogicalSize = LogicalSize::new(1024 * 64);
+pub(crate) const CHUNK_SIZE: LogicalSize = LogicalSize::new(1024 * 64);
 
 #[derive(Debug)]
 pub(crate) struct FrozenChunk {
@@ -91,6 +91,13 @@ impl MutableChunk {
             builder: Some(builder),
             chunk_id,
         }
+    }
+
+    pub(crate) fn get_snapshot(&self) -> Arc<dyn Array> {
+        self.builder
+            .as_ref()
+            .expect("Invalid State. Make sure to not have an active ChunkWriter.")
+            .finish_cloned()
     }
 
     pub(crate) fn builder<B: ArrayBuilder + sealed::Append + Send>(
