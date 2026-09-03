@@ -14,6 +14,13 @@ impl LogicalSize {
     }
 }
 
+impl Add<LogicalSize> for LogicalSize {
+    type Output = Self;
+    fn add(self, rhs: LogicalSize) -> Self::Output {
+        LogicalSize::new(self.0 + rhs.0)
+    }
+}
+
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LogicalOffset(u64);
