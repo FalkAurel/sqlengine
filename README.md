@@ -40,6 +40,18 @@ cargo clippy --all-targets  # lint
 cargo fmt                   # format
 ```
 
+## Releasing
+
+Before tagging a release, clean up all dead code — the strict release gate runs automatically when a version tag is pushed and will fail if any dead code remains.
+
+```sh
+# Once dead code is resolved:
+git tag v1.0.0
+git push --tags
+```
+
+The `release-check` CI job then runs `cargo clippy` with full `-D warnings` (dead code included) as a final gate before the tag is considered shippable.
+
 ### One-time GitHub Pages setup
 
 After the first successful `Benchmark` workflow run, enable GitHub Pages in
