@@ -32,7 +32,22 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features
+      # Allow dead_code during normal development; it is only a hard error in
+      # the release-check job below.
+      - run: cargo clippy --all-targets --all-features -- -D warnings -A dead-code
+
+  release-check:
+    name: Release check (strict)
+    runs-on: ubuntu-latest
+    # Only run on pushes to main, not on every PR.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
     name: Test

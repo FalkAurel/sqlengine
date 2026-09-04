@@ -4,10 +4,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use arrow::{
-    array::{Array, ArrayBuilder, ArrowPrimitiveType, BooleanBuilder, PrimitiveBuilder},
-    csv::writer,
-};
+use arrow::array::{Array, ArrayBuilder, ArrowPrimitiveType, BooleanBuilder, PrimitiveBuilder};
 
 use crate::storage_engine::{
     units::{LogicalSize, VersionID},
@@ -107,9 +104,9 @@ impl MutableChunk {
     pub(crate) fn builder<B: ArrayBuilder + sealed::Append + Send>(
         mut self,
     ) -> Result<ChunkWriter<B>, Self> {
-        let builder: &Box<dyn ArrayBuilder> = self
+        let builder: &dyn ArrayBuilder = self
             .builder
-            .as_ref()
+            .as_deref()
             .expect("MutableChunk builder must be present before type resolution");
 
         if builder.as_any().is::<B>() {
@@ -205,6 +202,7 @@ impl<B: ArrayBuilder + sealed::Append> ChunkWriter<B> {
     }
 
     #[inline(always)]
+    #[allow(clippy::type_complexity)]
     pub(crate) fn append_values(
         mut self,
         values: &[B::Element],

@@ -36,7 +36,7 @@ impl<'a, A: Array + sealed::Windowed> Vector<'a, A> {
         F: FnOnce(&<A as sealed::Windowed>::Window, Validity<'_, A>) -> R,
     {
         f(
-            &self.data.window(&self.range),
+            self.data.window(&self.range),
             Validity {
                 data: self.data,
                 base: self.range.start,
