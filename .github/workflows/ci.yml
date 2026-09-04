@@ -8,9 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Override .cargo/config.toml's target-cpu=native — GitHub runners don't
-  # guarantee the same CPU feature set and builds would fail or produce wrong code.
-  RUSTFLAGS: "-D warnings"
+  # Override .cargo/config.toml's target-cpu=native and allow dead_code for
+  # normal development. Dead code is only a hard error in release-check below.
+  RUSTFLAGS: "-D warnings -A dead-code"
 
 jobs:
   fmt:
@@ -32,22 +32,22 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Allow dead_code during normal development; it is only a hard error in
-      # the release-check job below.
-      - run: cargo clippy --all-targets --all-features -- -D warnings -A dead-code
+      - run: cargo clippy --all-targets --all-features
 
   release-check:
     name: Release check (strict)
     runs-on: ubuntu-latest
     # Only run on pushes to main, not on every PR.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    env:
+      RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --all-targets --all-features
 
   test:
     name: Test
