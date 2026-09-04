@@ -3,6 +3,13 @@ name = "plinth"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+bench = false
+
+[[bin]]
+name = "profile_column"
+bench = false
+
 [features]
 bench = ["dep:criterion"]
 
