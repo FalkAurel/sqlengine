@@ -92,7 +92,9 @@ pub fn bench_column_write_values(c: &mut Criterion) {
             let values: Vec<i32> = (0..size as i32).collect();
             b.iter(|| {
                 let mut column: Column = make_column(Int32Builder::new());
-                column.write_values::<Int32Builder>(black_box(&values)).unwrap();
+                column
+                    .write_values::<Int32Builder>(black_box(&values))
+                    .unwrap();
                 black_box(column);
             });
         });

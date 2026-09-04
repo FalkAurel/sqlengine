@@ -16,4 +16,3 @@ criterion_group!(
     bench_raw_arrow_chunked_retained
 );
 criterion_main!(benches);
-
