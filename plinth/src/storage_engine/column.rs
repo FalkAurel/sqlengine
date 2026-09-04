@@ -1,5 +1,5 @@
-use arrow::array::{Array, ArrayBuilder, Int32Array, Int32Builder};
-use std::{marker::PhantomData, ops::Range, sync::Arc};
+use arrow::array::{Array, ArrayBuilder};
+use std::{marker::PhantomData, sync::Arc};
 
 use crate::storage_engine::{
     chunk::{Append, ChunkWriter, FrozenChunk, MutableChunk},
@@ -33,7 +33,7 @@ impl Column {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn write<B: ArrayBuilder + Append + Send>(
         &mut self,
         values: impl Iterator<Item = <B as Append>::Element>,
@@ -75,6 +75,50 @@ impl Column {
         Ok(())
     }
 
+    #[inline(always)]
+    pub(crate) fn write_values<B: ArrayBuilder + Append + Send>(
+        &mut self,
+        mut values: &[<B as Append>::Element],
+    ) -> Result<(), InvalidDowncast> {
+        let mut writer: ChunkWriter<B> = match self
+            .tail
+            .take()
+            .expect("Impossible to fail since we manually set a MutableChunks")
+            .builder()
+        {
+            Ok(res) => res,
+            Err(err) => {
+                self.tail = Some(err);
+                return Err(InvalidDowncast);
+            }
+        };
+
+        while !values.is_empty() {
+            match writer.append_values(values) {
+                Ok(new_builder) => {
+                    writer = new_builder;
+                    break;
+                }
+                Err((mut builder, chunk_id, remainder)) => {
+                    let array: Arc<dyn Array> = builder.finish();
+                    self.publish_frozen_chunk(array, chunk_id);
+
+                    values = remainder;
+
+                    match MutableChunk::new(builder, (self.next_version)()).builder() {
+                        Ok(res) => writer = res,
+                        Err(_) => unreachable!(
+                            "builder type invariant violated: ChunkWriter returned a builder that MutableChunk could not recover"
+                        ),
+                    }
+                }
+            }
+        }
+
+        self.tail = Some(MutableChunk::from(writer));
+        Ok(())
+    }
+
     /// Returns the oldest frozen chunk, or `None` if no chunks have been frozen.
     pub(crate) fn read_frozen(&self) -> Option<Arc<FrozenChunk>> {
         self.head.clone()
@@ -92,7 +136,6 @@ impl Column {
         self.tail.as_ref().map(|inner| inner.get_snapshot())
     }
 
-    #[inline]
     fn publish_frozen_chunk(&mut self, array: Arc<dyn Array>, chunk_id: VersionID) {
         let current: Arc<FrozenChunk> = Arc::new(FrozenChunk::new(array, chunk_id));
         match self.frozen_tail.take() {
@@ -119,9 +162,13 @@ unsafe impl Send for Column {}
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use arrow::array::{Array, Int64Array, Int64Builder};
+    use arrow::array::{Array, Float32Builder, Int64Array, Int64Builder};
 
-    use crate::storage_engine::{chunk::CHUNK_SIZE, column::Column, units::VersionID};
+    use crate::storage_engine::{
+        chunk::CHUNK_SIZE,
+        column::{Column, InvalidDowncast},
+        units::VersionID,
+    };
 
     fn version_generator() -> Box<dyn Fn() -> VersionID> {
         let next_id: AtomicU64 = AtomicU64::new(0);
@@ -327,5 +374,167 @@ mod tests {
             .expect("partial final chunk should remain mutable");
 
         assert_eq!(mutable.len(), 123);
+    }
+
+    #[test]
+    fn write_values_less_than_chunk_size_keeps_data_mutable() {
+        let mut column = Column::new(version_generator(), Int64Builder::new());
+
+        let values: Vec<i64> = (0..100).collect();
+        column.write_values::<Int64Builder>(&values).unwrap();
+
+        assert!(column.read_frozen().is_none());
+        assert_eq!(column.read_mutable().unwrap().len(), 100);
+    }
+
+    #[test]
+    fn write_values_snapshot_reflects_written_data() {
+        let mut column = Column::new(version_generator(), Int64Builder::new());
+
+        column.write_values::<Int64Builder>(&[10, 20, 30]).unwrap();
+
+        let snapshot = column
+            .read_mutable()
+            .expect("mutable tail should exist")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("snapshot should be Int64Array")
+            .values()
+            .to_vec();
+
+        assert_eq!(snapshot, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn write_values_snapshot_is_point_in_time() {
+        let mut column = Column::new(version_generator(), Int64Builder::new());
+
+        column.write_values::<Int64Builder>(&[10, 20, 30]).unwrap();
+        let first = column.read_mutable().unwrap();
+
+        column.write_values::<Int64Builder>(&[40, 50]).unwrap();
+        let second = column.read_mutable().unwrap();
+
+        let first = first.as_any().downcast_ref::<Int64Array>().unwrap();
+        let second = second.as_any().downcast_ref::<Int64Array>().unwrap();
+
+        assert_eq!(first.values(), &[10, 20, 30]);
+        assert_eq!(second.values(), &[10, 20, 30, 40, 50]);
+    }
+
+    #[test]
+    fn write_values_filling_chunk_publishes_frozen() {
+        let mut column = Column::new(version_generator(), Int64Builder::new());
+
+        let values: Vec<i64> = (0..CHUNK_SIZE.get() as i64).collect();
+        column.write_values::<Int64Builder>(&values).unwrap();
+
+        let frozen = column.read_frozen().expect("full chunk should be frozen");
+
+        assert_eq!(frozen.chunk_id(), VersionID::new(0));
+        assert_eq!(
+            frozen.view::<Int64Array>().unwrap().array().len(),
+            CHUNK_SIZE.get() as usize
+        );
+        assert_eq!(column.read_mutable().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn write_values_crossing_multiple_chunks_builds_chain() {
+        let mut column = Column::new(version_generator(), Int64Builder::new());
+
+        let total = CHUNK_SIZE.get() * 2 + 10;
+        let values: Vec<i64> = (0..total as i64).collect();
+        column.write_values::<Int64Builder>(&values).unwrap();
+
+        let first = column
+            .read_frozen()
+            .expect("first frozen chunk should exist");
+        let second = first.next().expect("second frozen chunk should exist");
+
+        assert!(second.next().is_none());
+        assert_eq!(first.chunk_id(), VersionID::new(0));
+        assert_eq!(second.chunk_id(), VersionID::new(1));
+        assert_eq!(
+            first.view::<Int64Array>().unwrap().array().len(),
+            CHUNK_SIZE.get() as usize
+        );
+        assert_eq!(
+            second.view::<Int64Array>().unwrap().array().len(),
+            CHUNK_SIZE.get() as usize
+        );
+        assert_eq!(column.read_mutable().unwrap().len(), 10);
+    }
+
+    #[test]
+    fn write_values_preserves_insertion_order() {
+        let mut column = Column::new(version_generator(), Int64Builder::new());
+
+        let chunk_size = CHUNK_SIZE.get() as i64;
+        let values: Vec<i64> = (0..chunk_size * 2).collect();
+        column.write_values::<Int64Builder>(&values).unwrap();
+
+        let first = column.read_frozen().unwrap();
+        let second = first.next().unwrap();
+
+        let first_array = first.view::<Int64Array>().unwrap();
+        let second_array = second.view::<Int64Array>().unwrap();
+
+        assert_eq!(first_array.array().value(0), 0);
+        assert_eq!(
+            first_array.array().value(CHUNK_SIZE.get() as usize - 1),
+            chunk_size - 1
+        );
+        assert_eq!(second_array.array().value(0), chunk_size);
+        assert_eq!(
+            second_array.array().value(CHUNK_SIZE.get() as usize - 1),
+            chunk_size * 2 - 1
+        );
+    }
+
+    #[test]
+    fn write_values_version_ids_per_chunk() {
+        let mut column = Column::new(version_generator(), Int64Builder::new());
+
+        let values: Vec<i64> = (0..CHUNK_SIZE.get() as i64 * 3).collect();
+        column.write_values::<Int64Builder>(&values).unwrap();
+
+        let first = column.read_frozen().unwrap();
+        let second = first.next().unwrap();
+        let third = second.next().unwrap();
+
+        assert_eq!(first.chunk_id(), VersionID::new(0));
+        assert_eq!(second.chunk_id(), VersionID::new(1));
+        assert_eq!(third.chunk_id(), VersionID::new(2));
+        assert!(third.next().is_none());
+        assert_eq!(column.read_mutable().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn write_values_partial_final_chunk_remains_mutable() {
+        let mut column = Column::new(version_generator(), Int64Builder::new());
+
+        let total = CHUNK_SIZE.get() + 123;
+        let values: Vec<i64> = (0..total as i64).collect();
+        column.write_values::<Int64Builder>(&values).unwrap();
+
+        let frozen = column.read_frozen().expect("first chunk should be frozen");
+        assert_eq!(
+            frozen.view::<Int64Array>().unwrap().array().len(),
+            CHUNK_SIZE.get() as usize
+        );
+        assert_eq!(column.read_mutable().unwrap().len(), 123);
+    }
+
+    #[test]
+    fn write_values_wrong_type_returns_invalid_downcast() {
+        let mut column = Column::new(version_generator(), Int64Builder::new());
+
+        let result = column.write_values::<Float32Builder>(&[1.0, 2.0, 3.0]);
+
+        assert!(
+            matches!(result, Err(InvalidDowncast)),
+            "mismatched builder type must return InvalidDowncast"
+        );
     }
 }

@@ -1,9 +1,13 @@
 use std::{
+    debug_assert,
     fmt::Debug,
     sync::{Arc, OnceLock},
 };
 
-use arrow::array::{Array, ArrayBuilder, ArrowPrimitiveType, BooleanBuilder, PrimitiveBuilder};
+use arrow::{
+    array::{Array, ArrayBuilder, ArrowPrimitiveType, BooleanBuilder, PrimitiveBuilder},
+    csv::writer,
+};
 
 use crate::storage_engine::{
     units::{LogicalSize, VersionID},
@@ -180,8 +184,9 @@ impl<B: ArrayBuilder + sealed::Append> ChunkWriter<B> {
     /// Therefore, callers can rely on the invariant that every value passed
     /// to `append` is inserted exactly once, and `Err` means that the
     /// insertion just completed the chunk.
-    pub fn append(mut self, value: B::Element) -> Result<Self, (Box<B>, VersionID)> {
-        assert!(
+    #[inline(always)]
+    pub(crate) fn append(mut self, value: B::Element) -> Result<Self, (Box<B>, VersionID)> {
+        debug_assert!(
             self.builder_ref().len() < CHUNK_SIZE.get() as usize,
             "State Machine should never enter a state where we have a full buffer but keep writing to it."
         );
@@ -198,6 +203,32 @@ impl<B: ArrayBuilder + sealed::Append> ChunkWriter<B> {
             Err((builder, self.chunk_id))
         }
     }
+
+    #[inline(always)]
+    pub(crate) fn append_values(
+        mut self,
+        values: &[B::Element],
+    ) -> Result<Self, (Box<B>, VersionID, &[B::Element])> {
+        debug_assert!(
+            self.builder_ref().len() < CHUNK_SIZE.get() as usize,
+            "State Machine should never enter a state where we have a full buffer but keep writing to it."
+        );
+
+        let capacity: usize = CHUNK_SIZE.get() as usize - self.builder_ref().len();
+        let (written, returnable) = values.split_at(values.len().min(capacity));
+        Append::append_values(self.builder_mut(), written);
+
+        if self.builder_ref().len() == CHUNK_SIZE.get() as usize {
+            let builder: Box<B> = self
+                .builder
+                .take()
+                .expect("ChunkWriter builder must be present when chunk is full");
+
+            Err((builder, self.chunk_id, returnable))
+        } else {
+            Ok(self)
+        }
+    }
 }
 
 pub(crate) use sealed::Append;
@@ -205,24 +236,31 @@ mod sealed {
     pub(crate) trait Append {
         type Element;
         fn append(&mut self, value: Self::Element);
+        fn append_values(&mut self, values: &[Self::Element]);
     }
 }
 
 impl<T: ArrowPrimitiveType> sealed::Append for PrimitiveBuilder<T> {
     type Element = <T as ArrowPrimitiveType>::Native;
 
-    #[inline(always)]
     fn append(&mut self, value: Self::Element) {
         self.append_value(value);
+    }
+
+    fn append_values(&mut self, values: &[Self::Element]) {
+        self.append_slice(values);
     }
 }
 
 impl sealed::Append for BooleanBuilder {
     type Element = bool;
-    
-    #[inline(always)]
+
     fn append(&mut self, value: Self::Element) {
         BooleanBuilder::append_value(self, value);
+    }
+
+    fn append_values(&mut self, values: &[Self::Element]) {
+        self.append_slice(values);
     }
 }
 
@@ -503,6 +541,93 @@ mod test {
         let n = CHUNK_SIZE.get() as i64 - 1;
 
         assert_eq!(cum_sum, n * (n + 1) / 2);
+    }
+
+    #[test]
+    fn append_values_fits_within_chunk() {
+        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let mutable_chunk = MutableChunk::new(builder, VersionID::new(0));
+        let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+
+        let values: Vec<i64> = (0..10).collect();
+        let writer = writer
+            .append_values(&values)
+            .expect("slice smaller than capacity must return Ok");
+
+        assert_eq!(writer.builder_ref().len(), 10);
+    }
+
+    #[test]
+    fn append_values_exactly_fills_chunk() {
+        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let mutable_chunk = MutableChunk::new(builder, VersionID::new(7));
+        let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+
+        let values: Vec<i64> = (0..CHUNK_SIZE.get() as i64).collect();
+        let (finished_builder, version_id, remainder) = match writer.append_values(&values) {
+            Err(tuple) => tuple,
+            Ok(_) => panic!("exact fill must return Err with empty remainder"),
+        };
+
+        assert_eq!(version_id, VersionID::new(7));
+        assert_eq!(finished_builder.len(), CHUNK_SIZE.get() as usize);
+        assert!(remainder.is_empty());
+    }
+
+    #[test]
+    fn append_values_overflow_returns_remaining() {
+        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let mutable_chunk = MutableChunk::new(builder, VersionID::new(3));
+        let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+
+        let overflow = 5usize;
+        let values: Vec<i64> = (0..CHUNK_SIZE.get() as i64 + overflow as i64).collect();
+        let (finished_builder, version_id, remaining) = match writer.append_values(&values) {
+            Err(tuple) => tuple,
+            Ok(_) => panic!("overflow must return Err with the remaining slice"),
+        };
+
+        assert_eq!(version_id, VersionID::new(3));
+        assert_eq!(finished_builder.len(), CHUNK_SIZE.get() as usize);
+        assert_eq!(remaining.len(), overflow);
+        assert_eq!(remaining, &values[CHUNK_SIZE.get() as usize..]);
+    }
+
+    #[test]
+    fn append_values_overflow_from_partial_chunk() {
+        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let mutable_chunk = MutableChunk::new(builder, VersionID::new(5));
+        let mut writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+
+        let pre_filled = 10usize;
+        for v in 0..pre_filled as i64 {
+            writer = writer.append(v).expect("chunk should have capacity");
+        }
+
+        let overflow = 3usize;
+        let remaining_capacity = CHUNK_SIZE.get() as usize - pre_filled;
+        let values: Vec<i64> = (0..remaining_capacity as i64 + overflow as i64).collect();
+        let (finished_builder, version_id, remaining) = match writer.append_values(&values) {
+            Err(tuple) => tuple,
+            Ok(_) => panic!("overflow must return Err"),
+        };
+
+        assert_eq!(version_id, VersionID::new(5));
+        assert_eq!(finished_builder.len(), CHUNK_SIZE.get() as usize);
+        assert_eq!(remaining.len(), overflow);
+    }
+
+    #[test]
+    fn append_values_empty_slice_is_noop() {
+        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let mutable_chunk = MutableChunk::new(builder, VersionID::new(0));
+        let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+
+        let writer = writer
+            .append_values(&[])
+            .expect("empty slice must return Ok");
+
+        assert_eq!(writer.builder_ref().len(), 0);
     }
 
     #[test]
