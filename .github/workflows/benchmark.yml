@@ -23,7 +23,7 @@ jobs:
         # Override target-cpu=native from .cargo/config.toml — CI runners have
         # generic CPUs and the flag would either fail or produce inconsistent results.
         run: |
-          RUSTFLAGS="" cargo bench --features bench -- --output-format bencher 2>&1 | tee output.txt
+          RUSTFLAGS="" cargo bench --features bench --benches -- --output-format bencher 2>&1 | tee output.txt
 
       - name: Store benchmark results
         uses: benchmark-action/github-action-benchmark@v1
