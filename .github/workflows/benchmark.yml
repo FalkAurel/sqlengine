@@ -1,0 +1,43 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  deployments: write
+
+jobs:
+  benchmark:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmarks
+        # Override target-cpu=native from .cargo/config.toml — CI runners have
+        # generic CPUs and the flag would either fail or produce inconsistent results.
+        run: |
+          RUSTFLAGS="" cargo bench --features bench -- --output-format bencher 2>&1 | tee output.txt
+
+      - name: Store benchmark results
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: cargo
+          output-file-path: output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Push results to gh-pages branch (enable Pages in repo Settings first)
+          auto-push: true
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          # Post a comment and mark the workflow as failed when a regression
+          # exceeds 150% of the stored baseline (i.e. >50% slower).
+          alert-threshold: "150%"
+          comment-on-alert: true
+          fail-on-alert: false
+          alert-comment-cc-users: "@FalkAurel"

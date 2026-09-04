@@ -1,5 +1,7 @@
+use std::ops::Add;
+
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LogicalSize(u64);
 
 impl LogicalSize {
@@ -12,8 +14,15 @@ impl LogicalSize {
     }
 }
 
+impl Add<LogicalSize> for LogicalSize {
+    type Output = Self;
+    fn add(self, rhs: LogicalSize) -> Self::Output {
+        LogicalSize::new(self.0 + rhs.0)
+    }
+}
+
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LogicalOffset(u64);
 
 impl LogicalOffset {
@@ -22,6 +31,34 @@ impl LogicalOffset {
     }
 
     pub const fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Add<LogicalSize> for LogicalOffset {
+    type Output = Self;
+    fn add(self, rhs: LogicalSize) -> Self::Output {
+        LogicalOffset::new(self.0 + rhs.0)
+    }
+}
+
+impl Add<LogicalOffset> for LogicalOffset {
+    type Output = Self;
+    fn add(self, rhs: LogicalOffset) -> Self::Output {
+        LogicalOffset::new(self.0 + rhs.0)
+    }
+}
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VersionID(u64);
+
+impl VersionID {
+    pub(crate) const fn new(version: u64) -> Self {
+        Self(version)
+    }
+
+    pub(crate) const fn get(&self) -> u64 {
         self.0
     }
 }

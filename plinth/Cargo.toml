@@ -3,10 +3,17 @@ name = "plinth"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+bench = ["dep:criterion"]
+
 [dependencies]
 arrow = "59.2.0"
 tracing = "0.1.44"
+criterion = { version = "0.8.2", optional = true }
 
 [dev-dependencies]
-shuttle = "0.9.1"
-criterion = "0.8.2"
+#shuttle = "0.9.1"
+
+[[bench]]
+name = "column"
+harness = false

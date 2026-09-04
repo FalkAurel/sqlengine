@@ -1,2 +1,11 @@
-/plinth/target
-/target
+# Rust
+Cargo.lock
+target/
+
+# Profiling
+perf.data
+perf.data.old
+flamegraph.svg
+
+# Editor
+.vscode/
