@@ -12,7 +12,7 @@ tracing = "0.1.44"
 criterion = { version = "0.8.2", optional = true }
 
 [dev-dependencies]
-shuttle = "0.9.1"
+#shuttle = "0.9.1"
 
 [[bench]]
 name = "column"

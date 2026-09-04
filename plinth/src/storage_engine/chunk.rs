@@ -20,7 +20,7 @@ pub(crate) struct FrozenChunk {
 }
 
 impl FrozenChunk {
-    pub(crate) fn new(array: Arc<dyn Array>, chunk_id: VersionID) -> Self {
+    pub(crate) const fn new(array: Arc<dyn Array>, chunk_id: VersionID) -> Self {
         Self {
             array,
             chunk_id,
@@ -210,6 +210,8 @@ mod sealed {
 
 impl<T: ArrowPrimitiveType> sealed::Append for PrimitiveBuilder<T> {
     type Element = <T as ArrowPrimitiveType>::Native;
+
+    #[inline(always)]
     fn append(&mut self, value: Self::Element) {
         self.append_value(value);
     }
@@ -217,6 +219,8 @@ impl<T: ArrowPrimitiveType> sealed::Append for PrimitiveBuilder<T> {
 
 impl sealed::Append for BooleanBuilder {
     type Element = bool;
+    
+    #[inline(always)]
     fn append(&mut self, value: Self::Element) {
         BooleanBuilder::append_value(self, value);
     }

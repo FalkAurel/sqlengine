@@ -1,5 +1,5 @@
-use arrow::array::{Array, ArrayBuilder};
-use std::{marker::PhantomData, sync::Arc};
+use arrow::array::{Array, ArrayBuilder, Int32Array, Int32Builder};
+use std::{marker::PhantomData, ops::Range, sync::Arc};
 
 use crate::storage_engine::{
     chunk::{Append, ChunkWriter, FrozenChunk, MutableChunk},
@@ -33,6 +33,7 @@ impl Column {
         }
     }
 
+    #[inline]
     pub(crate) fn write<B: ArrayBuilder + Append + Send>(
         &mut self,
         values: impl Iterator<Item = <B as Append>::Element>,
@@ -91,6 +92,7 @@ impl Column {
         self.tail.as_ref().map(|inner| inner.get_snapshot())
     }
 
+    #[inline]
     fn publish_frozen_chunk(&mut self, array: Arc<dyn Array>, chunk_id: VersionID) {
         let current: Arc<FrozenChunk> = Arc::new(FrozenChunk::new(array, chunk_id));
         match self.frozen_tail.take() {
