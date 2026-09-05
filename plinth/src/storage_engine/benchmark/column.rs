@@ -4,7 +4,10 @@ use arrow::array::{ArrayBuilder, Int32Builder};
 use criterion::{BenchmarkId, Criterion, Throughput};
 use std::sync::atomic::AtomicU64;
 
-use crate::storage_engine::{chunk::CHUNK_SIZE, column::Column};
+use crate::{
+    storage_engine::{chunk::CHUNK_SIZE, column::Column},
+    units::VersionID,
+};
 
 fn version_generator() -> Box<dyn Fn() -> VersionID> {
     let next_id: AtomicU64 = AtomicU64::new(0);
@@ -43,7 +46,6 @@ pub fn bench_column_write(c: &mut Criterion) {
 
     group.finish();
 }
-
 
 pub fn bench_column_write_values(c: &mut Criterion) {
     let mut group = c.benchmark_group("column_write_values");

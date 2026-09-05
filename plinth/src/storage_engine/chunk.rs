@@ -160,6 +160,7 @@ impl<B: ArrayBuilder + sealed::Append> ChunkWriter<B> {
     /// Therefore, callers can rely on the invariant that every value passed
     /// to `append` is inserted exactly once, and `Err` means that the
     /// insertion just completed the chunk.
+    #[inline(always)]
     pub(crate) fn append(mut self, value: B::Element) -> Result<Self, (Box<B>, VersionID)> {
         debug_assert!(
             self.builder.len() < CHUNK_SIZE.get() as usize,
