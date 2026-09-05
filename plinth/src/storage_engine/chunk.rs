@@ -121,7 +121,7 @@ impl MutableChunk {
                 .expect("builder type must match the type checked above");
 
             Ok(ChunkWriter {
-                builder: builder,
+                builder,
                 chunk_id: self.chunk_id,
             })
         } else {
