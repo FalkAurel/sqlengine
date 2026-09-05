@@ -121,7 +121,7 @@ impl MutableChunk {
                 .expect("builder type must match the type checked above");
 
             Ok(ChunkWriter {
-                builder: Some(builder),
+                builder: builder,
                 chunk_id: self.chunk_id,
             })
         } else {
@@ -129,41 +129,20 @@ impl MutableChunk {
         }
     }
 
-    pub(crate) fn from<B: ArrayBuilder + sealed::Append + Send>(
-        mut writer: ChunkWriter<B>,
-    ) -> Self {
+    pub(crate) fn from<B: ArrayBuilder + sealed::Append + Send>(writer: ChunkWriter<B>) -> Self {
         Self {
-            builder: Some(
-                writer
-                    .builder
-                    .take()
-                    .expect("ChunkWriter builder must be present when converting to MutableChunk"),
-            ),
+            builder: Some(writer.builder),
             chunk_id: writer.chunk_id,
         }
     }
 }
 
 pub(crate) struct ChunkWriter<B: ArrayBuilder + sealed::Append + Send> {
-    builder: Option<Box<B>>,
+    builder: Box<B>,
     chunk_id: VersionID,
 }
 
 impl<B: ArrayBuilder + sealed::Append> ChunkWriter<B> {
-    #[inline]
-    fn builder_ref(&self) -> &B {
-        self.builder
-            .as_deref()
-            .expect("ChunkWriter builder must be present")
-    }
-
-    #[inline]
-    fn builder_mut(&mut self) -> &mut B {
-        self.builder
-            .as_deref_mut()
-            .expect("ChunkWriter builder must be present")
-    }
-
     /// Appends a value to the chunk, consuming the value before checking
     /// whether the chunk has reached `CHUNK_SIZE`.
     ///
@@ -181,48 +160,36 @@ impl<B: ArrayBuilder + sealed::Append> ChunkWriter<B> {
     /// Therefore, callers can rely on the invariant that every value passed
     /// to `append` is inserted exactly once, and `Err` means that the
     /// insertion just completed the chunk.
-    #[inline(always)]
     pub(crate) fn append(mut self, value: B::Element) -> Result<Self, (Box<B>, VersionID)> {
         debug_assert!(
-            self.builder_ref().len() < CHUNK_SIZE.get() as usize,
+            self.builder.len() < CHUNK_SIZE.get() as usize,
             "State Machine should never enter a state where we have a full buffer but keep writing to it."
         );
-        self.builder_mut().append(value);
+        self.builder.append(value);
 
-        if self.builder_ref().len() < CHUNK_SIZE.get() as usize {
+        if self.builder.len() < CHUNK_SIZE.get() as usize {
             Ok(self)
         } else {
-            let builder: Box<B> = self
-                .builder
-                .take()
-                .expect("ChunkWriter builder must be present when chunk is full");
-
-            Err((builder, self.chunk_id))
+            Err((self.builder, self.chunk_id))
         }
     }
 
-    #[inline(always)]
     #[allow(clippy::type_complexity)]
     pub(crate) fn append_values(
         mut self,
         values: &[B::Element],
     ) -> Result<Self, (Box<B>, VersionID, &[B::Element])> {
         debug_assert!(
-            self.builder_ref().len() < CHUNK_SIZE.get() as usize,
+            self.builder.len() < CHUNK_SIZE.get() as usize,
             "State Machine should never enter a state where we have a full buffer but keep writing to it."
         );
 
-        let capacity: usize = CHUNK_SIZE.get() as usize - self.builder_ref().len();
+        let capacity: usize = CHUNK_SIZE.get() as usize - self.builder.len();
         let (written, returnable) = values.split_at(values.len().min(capacity));
-        Append::append_values(self.builder_mut(), written);
+        Append::append_values(self.builder.as_mut(), written);
 
-        if self.builder_ref().len() == CHUNK_SIZE.get() as usize {
-            let builder: Box<B> = self
-                .builder
-                .take()
-                .expect("ChunkWriter builder must be present when chunk is full");
-
-            Err((builder, self.chunk_id, returnable))
+        if self.builder.len() == CHUNK_SIZE.get() as usize {
+            Err((self.builder, self.chunk_id, returnable))
         } else {
             Ok(self)
         }
@@ -340,7 +307,7 @@ mod test {
 
         let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
 
-        assert_eq!(writer.builder_ref().len(), 0);
+        assert_eq!(writer.builder.len(), 0);
     }
 
     #[test]
@@ -364,7 +331,7 @@ mod test {
         // type resolution.
         let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
 
-        assert_eq!(writer.builder_ref().len(), 0);
+        assert_eq!(writer.builder.len(), 0);
     }
 
     #[test]
@@ -381,7 +348,7 @@ mod test {
         let mutable_chunk = MutableChunk::from(writer);
         let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
 
-        assert_eq!(writer.builder_ref().len(), 3);
+        assert_eq!(writer.builder.len(), 3);
     }
 
     #[test]
@@ -552,7 +519,7 @@ mod test {
             .append_values(&values)
             .expect("slice smaller than capacity must return Ok");
 
-        assert_eq!(writer.builder_ref().len(), 10);
+        assert_eq!(writer.builder.len(), 10);
     }
 
     #[test]
@@ -625,7 +592,7 @@ mod test {
             .append_values(&[])
             .expect("empty slice must return Ok");
 
-        assert_eq!(writer.builder_ref().len(), 0);
+        assert_eq!(writer.builder.len(), 0);
     }
 
     #[test]
@@ -639,7 +606,7 @@ mod test {
         writer = writer.append(false).unwrap();
         writer = writer.append(true).unwrap();
 
-        assert_eq!(writer.builder_ref().len(), 3);
+        assert_eq!(writer.builder.len(), 3);
     }
 
     #[test]
