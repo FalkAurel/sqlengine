@@ -5,8 +5,8 @@ use criterion::{BenchmarkId, Criterion, Throughput};
 use std::sync::atomic::AtomicU64;
 
 use crate::{
-    chunk::{ChunkWriter, MutableChunk},
-    storage_engine::{chunk::CHUNK_SIZE, column::Column, units::VersionID},
+    storage_engine::{chunk::CHUNK_SIZE, column::Column},
+    units::VersionID,
 };
 
 fn version_generator() -> Box<dyn Fn() -> VersionID> {
@@ -43,35 +43,6 @@ pub fn bench_column_write(c: &mut Criterion) {
             });
         });
     }
-
-    group.finish();
-}
-
-pub fn bench_chunk_writer_append(c: &mut Criterion) {
-    let mut group = c.benchmark_group("chunk_writer_append");
-    group.throughput(Throughput::Elements(CHUNK_SIZE.get()));
-
-    group.bench_function("65536", |b| {
-        b.iter(|| {
-            let tail = MutableChunk::new(Box::new(Int32Builder::new()), VersionID::new(0));
-
-            let mut writer: ChunkWriter<Int32Builder> =
-                unsafe { tail.builder().unwrap_unchecked() };
-
-            let values = 0..CHUNK_SIZE.get() as i32 - 1;
-
-            for value in values {
-                match writer.append(value) {
-                    Ok(new_builder) => {
-                        writer = new_builder;
-                    }
-                    Err(_) => unreachable!(),
-                }
-            }
-
-            black_box(MutableChunk::from(writer));
-        });
-    });
 
     group.finish();
 }
