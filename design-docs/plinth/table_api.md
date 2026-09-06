@@ -8,175 +8,309 @@ The table is the owner of relational operations. Its responsibilities are delibe
 * deleting rows,
 * acquiring snapshots.
 
-The table owns the implementation of these operations. In particular, insertion is implemented by `Table<T>` itself rather than being delegated to the row type.
+The implementation of these operations belongs to the table itself. In particular, insertion is not delegated to `T`.
 
 ## Row type `T`
 
-`T` defines the shape of a row.
+`T` defines the shape of a row and provides the information necessary for the table to access that row's fields.
 
-A type used as `T` must provide a way for the library to access its fields and the underlying data represented by those fields. This is the only responsibility of the row implementation.
+A `T` implementation is responsible for describing its fields and providing access to the underlying data of those fields.
 
-The row type does **not** perform insertion and does not need to know how the table stores its data.
+It is **not** responsible for performing table operations.
 
-Conceptually:
+The distinction is:
+
+> **`T` describes and exposes its data. `Table<T>` decides what to do with that data.**
+
+The row implementation therefore must not know about:
+
+* table storage,
+* insertion,
+* deletion,
+* snapshots,
+* Arrow builders,
+* Arrow arrays,
+* or any other storage-specific operation.
+
+## Field representation
+
+A field consists conceptually of two parts:
+
+```text
+Field metadata
+├── name
+└── type
+
+Field value
+└── data
+```
+
+The field's name and type describe the field, while its data is the value belonging to a particular row.
+
+The type may use Arrow's type system where appropriate. This allows the structural description of `T` to map naturally onto the table's schema.
+
+For example:
+
+```text
+User
+├── id     → Int64   → <id>
+├── name   → Utf8    → <name>
+└── active → Boolean → <active>
+```
+
+The underlying data associated with a field must correspond to its declared type.
+
+## Static metadata and row data
+
+Field metadata is a property of the row type, not of an individual row.
+
+For example, every `User` has the same structure:
+
+```text
+id     → Int64
+name   → Utf8
+active → Boolean
+```
+
+Only the values change between instances.
+
+Therefore, the implementation must avoid materializing a collection of field descriptors for every row.
+
+In particular, inserting a row should not require constructing a `Vec<Field>` or an equivalent heap-allocated representation.
+
+Conceptually, the information is divided into:
+
+```text
+                    T
+                    │
+          ┌─────────┴─────────┐
+          │                   │
+       metadata             instance
+          │                   │
+    id → Int64              &id
+    name → Utf8             &name
+    active → Boolean        &active
+```
+
+The metadata belongs to the type, while access to the values is performed directly against the row instance.
+
+Metadata must therefore be available independently of any particular row. This allows the table to construct a schema without first creating a row.
+
+## Field access
+
+`T` provides a mechanism for the table to access its fields without creating an intermediate collection.
+
+Conceptually, this may take the form of a visitor or another statically known mechanism:
+
+```rust
+trait TableRow {
+    fn visit_fields<V: FieldVisitor>(&self, visitor: &mut V);
+}
+```
+
+The exact representation is an implementation detail.
+
+The important property is that field access does not require allocating or constructing a runtime collection for each row.
+
+A generated implementation can expose the fields directly from the row:
+
+```text
+row
+│
+├── field 0 → id
+├── field 1 → name
+└── field 2 → active
+```
+
+The table can then consume those values immediately.
+
+The fields have a stable order, and that order is consistent with the type's metadata. This allows the table to deterministically associate each field with the corresponding column.
+
+This allows the insertion path to operate directly on the underlying values:
 
 ```text
 T
 │
-├── describes its fields
-└── provides access to their underlying data
-        │
-        ▼
-    Table<T>
-        │
-        ├── inserts rows
-        ├── deletes rows
-        └── acquires snapshots
+│ field access
+▼
+Table<T>::insert
+│
+│ direct write
+▼
+underlying storage
 ```
 
-The distinction is intentional:
+No intermediate row representation is required.
 
-> **`T` provides access to data. `Table<T>` decides what to do with that data.**
+## Table-owned insertion
 
-An implementation for `T` therefore must not contain operations such as `insert`, `append`, or `write`. Those operations belong exclusively to the table.
-
-## Field access
-
-The trait implemented by `T` provides structural access to its fields.
-
-For example, a row type might conceptually expose:
-
-```rust
-trait TableRow {
-    type Fields<'a>
-    where
-        Self: 'a;
-
-    fn fields(&self) -> Self::Fields<'_>;
-}
-```
-
-The exact representation of `Fields` is an implementation detail. It may be generated for the concrete row type, but its purpose remains the same: give the table access to the underlying values contained by `T`.
-
-The implementation does not determine how those values are stored.
-
-For an Arrow-backed table, for example, `T` does not construct Arrow arrays or append values to Arrow builders. The table receives the field data and performs the appropriate Arrow operations itself.
-
-This keeps Arrow and other storage-specific concerns entirely within the table implementation.
-
-## Schema
-
-The same structural information provided by `T` can be used by the library to derive the relation's schema.
-
-A row implementation describes the fields that make up `T`, including the information required to construct the corresponding `arrow::Field` values.
-
-The transformation from the structural representation of `T` into the storage schema is a library concern.
-
-Thus, the boundary remains:
-
-```text
-T
- └── describes fields and exposes their data
-
-Table<T>
- ├── derives/owns the relation schema
- ├── inserts
- ├── deletes
- └── acquires snapshots
-```
-
-`T` describes **what a row is**. The table determines **how that row participates in the relation**.
-
-## Insertion
-
-Insertion is a responsibility of `Table<T>`.
-
-When a value of `T` is supplied to `insert`, the table accesses its fields through the row interface and performs the insertion into its underlying storage.
+`Table<T>` is responsible for interpreting the fields provided by `T` and performing insertion.
 
 Conceptually:
 
 ```rust
 impl<T: TableRow> Table<T> {
     pub fn insert(&mut self, row: T) {
-        let fields = row.fields();
-
-        // Table owns the insertion algorithm.
-        // It interprets `fields` and writes them to storage.
+        // Access the fields of `row`.
+        // Interpret them according to T's metadata.
+        // Insert them into the table's underlying storage.
     }
 }
 ```
 
-The important property is that the algorithm is not split between the table and `T`.
+The row implementation only provides access to the data.
 
-The row implementation supplies the data; the table consumes it.
+It does not perform the insertion itself.
 
-This means all row types use the same insertion mechanism, and changes to the storage or insertion strategy do not require changes to every row implementation.
+This is an important boundary. An implementation such as:
+
+```rust
+fn append_to(&self, columns: &mut Columns);
+```
+
+would be undesirable because it would make `T` aware of the table's storage model and would move insertion logic out of `Table<T>`.
+
+Instead, the row implementation exposes structure and data, while the table owns the algorithm that consumes them.
+
+The field access mechanism may expose values by reference or in another form appropriate for the insertion path. The design does not require a particular ownership strategy, as long as accessing the fields does not require constructing an intermediate collection.
+
+## Schema
+
+The same static field metadata used to describe `T` can be used to construct the relation's schema.
+
+For example:
+
+```text
+T
+│
+└── field metadata
+    ├── id     → Int64
+    ├── name   → Utf8
+    └── active → Boolean
+```
+
+can be transformed by the library into the corresponding Arrow schema fields.
+
+This metadata is independent of any particular row instance.
+
+Consequently, schema construction does not require creating field descriptors for each inserted row.
+
+The relationship is:
+
+```text
+T's static metadata
+        │
+        ├── schema construction
+        │
+        └── interpretation during insertion
+```
+
+The row instance only supplies the changing data.
+
+## Insertion without per-row allocation
+
+The intended insertion path is therefore:
+
+```text
+             User
+              │
+              │ direct field access
+              ▼
+        Table<User>
+              │
+              │ interpret fields
+              ▼
+       Arrow-backed storage
+```
+
+For a row such as:
+
+```rust
+User {
+    id: 42,
+    name: "Alice".into(),
+    active: true,
+}
+```
+
+the table should be able to access the values directly rather than first constructing:
+
+```text
+[
+    Field("id", Int64, 42),
+    Field("name", Utf8, "Alice"),
+    Field("active", Boolean, true),
+]
+```
+
+The latter is an unnecessary intermediate representation.
+
+The goal is that the abstraction itself does not introduce a heap allocation merely to describe the row. The underlying storage may of course allocate as necessary when growing buffers or storing data.
 
 ## Deletion
 
-Deletion is likewise owned by `Table<T>`.
+Deletion is owned by `Table<T>`.
 
-The table defines what constitutes a row deletion and performs the corresponding operation against its underlying representation.
+The table defines the semantics of removing a row and performs the corresponding operation against its underlying storage.
 
-The row type has no knowledge of deletion.
-
-This keeps deletion, like insertion, as a property of the relation rather than a property of an individual row value.
+`T` has no responsibility for deletion.
 
 ## Snapshots
 
 A table can provide a snapshot of its current state.
 
-The snapshot is a result of the table operation and is therefore acquired through `Table<T>`.
+The snapshot is acquired through `Table<T>` and represents the table's state according to the semantics defined by the table implementation.
 
-The internal structure of a snapshot is deliberately outside the responsibility of the `Table<T>` abstraction. The table only needs to provide the operation for obtaining one.
+The snapshot does not require `T` to know how the table is stored or how snapshots are implemented.
 
-How a snapshot represents its data, how it shares storage, whether it is immutable, and how it is physically backed are separate implementation concerns.
+How a snapshot represents its data, how it shares storage with the table, and how it is physically backed are implementation details.
 
 ## Abstraction boundary
 
-The design can therefore be summarized as three responsibilities.
+The design can be summarized as follows.
 
 ### `T`
 
 `T` is responsible for:
 
 * defining the logical row shape,
-* exposing its fields,
-* exposing the underlying data of those fields,
-* providing the structural information required to describe those fields.
+* describing its fields,
+* providing field names and types,
+* providing access to the data of each field,
+* exposing that information without requiring a per-row field collection.
 
-`T` is **not** responsible for:
+`T` is not responsible for:
 
-* inserting itself,
-* deleting itself,
-* interacting with Arrow storage,
-* knowing about table columns,
-* constructing snapshots.
+* inserting data,
+* deleting rows,
+* manipulating table storage,
+* constructing snapshots,
+* or knowing how the table performs its operations.
 
 ### `Table<T>`
 
 `Table<T>` is responsible for:
 
 * representing the relation,
-* enforcing that inserted values conform to `T`,
+* enforcing the row type `T`,
+* interpreting the field information provided by `T`,
 * implementing insertion,
 * implementing deletion,
-* providing snapshots.
-
-The table owns the algorithms associated with these operations.
+* providing snapshots,
+* and managing the underlying storage.
 
 ### Storage
 
 The underlying storage is an implementation detail of the table.
 
-The table is free to use Arrow arrays, builders, buffers, or another representation as required. Those details should not leak into the row abstraction.
+The table may use Arrow arrays, builders, buffers, or another representation as required. Those details should not leak into the row abstraction.
 
 The resulting dependency direction is:
 
 ```text
              T
              │
-             │ field/data access
+             │ structure + data access
              ▼
         ┌───────────┐
         │ Table<T>  │
@@ -186,13 +320,23 @@ The resulting dependency direction is:
         │ snapshot  │
         └─────┬─────┘
               │
-              │ owns/uses
+              │ owns / operates on
               ▼
-        underlying storage
+       underlying storage
 ```
 
-The central design principle is therefore:
+## Design principles
 
-> **The row type exposes data; the table owns behavior.**
+The design is based on a small number of principles:
 
-This keeps the row abstraction minimal while allowing `Table<T>` to retain complete control over insertion, deletion, snapshots, schema construction, and the underlying storage strategy.
+> **`T` provides typed field information and direct access to its data.**
+
+> **Field metadata belongs to the type, not to each row instance.**
+
+> **`Table<T>` owns the interpretation of that data and all relational operations.**
+
+> **The insertion path must not require allocating an intermediate collection merely to describe a row.**
+
+> **Storage details must remain below the `Table<T>` abstraction.**
+
+This keeps the row abstraction purely structural while giving `Table<T>` complete control over insertion, deletion, snapshots, schema construction, and the underlying storage strategy.
