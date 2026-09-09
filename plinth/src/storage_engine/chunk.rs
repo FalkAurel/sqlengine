@@ -197,16 +197,68 @@ impl<B: ArrayBuilder + sealed::Append> ChunkWriter<B> {
     }
 }
 
-pub(crate) use sealed::Append;
+pub(crate) use sealed::{Append, AppendableType};
 mod sealed {
+    use arrow::array::{
+        ArrayBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int8Builder, Int16Builder,
+        Int32Builder, Int64Builder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
+    };
+
     pub(crate) trait Append {
-        type Element;
+        type Element: AppendableType;
         fn append(&mut self, value: Self::Element);
         fn append_values(&mut self, values: &[Self::Element]);
     }
+
+    pub trait AppendableType {
+        type Builder: ArrayBuilder + Append<Element = Self>;
+    }
+
+    impl AppendableType for bool {
+        type Builder = BooleanBuilder;
+    }
+    impl AppendableType for i8 {
+        type Builder = Int8Builder;
+    }
+    impl AppendableType for i16 {
+        type Builder = Int16Builder;
+    }
+    impl AppendableType for i32 {
+        type Builder = Int32Builder;
+    }
+
+    impl AppendableType for i64 {
+        type Builder = Int64Builder;
+    }
+
+    impl AppendableType for u8 {
+        type Builder = UInt8Builder;
+    }
+
+    impl AppendableType for u16 {
+        type Builder = UInt16Builder;
+    }
+    impl AppendableType for u32 {
+        type Builder = UInt32Builder;
+    }
+
+    impl AppendableType for u64 {
+        type Builder = UInt64Builder;
+    }
+
+    impl AppendableType for f32 {
+        type Builder = Float32Builder;
+    }
+
+    impl AppendableType for f64 {
+        type Builder = Float64Builder;
+    }
 }
 
-impl<T: ArrowPrimitiveType> sealed::Append for PrimitiveBuilder<T> {
+impl<T: ArrowPrimitiveType> sealed::Append for PrimitiveBuilder<T>
+where
+    T::Native: AppendableType,
+{
     type Element = <T as ArrowPrimitiveType>::Native;
 
     fn append(&mut self, value: Self::Element) {
