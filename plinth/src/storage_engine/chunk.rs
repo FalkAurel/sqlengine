@@ -176,6 +176,7 @@ impl<B: ArrayBuilder + sealed::Append> ChunkWriter<B> {
     }
 
     #[allow(clippy::type_complexity)]
+    #[inline(always)]
     pub(crate) fn append_values(
         mut self,
         values: &[B::Element],

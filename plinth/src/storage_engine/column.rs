@@ -33,6 +33,7 @@ impl Column {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn write<B: ArrayBuilder + Append + Send>(
         &mut self,
         values: impl Iterator<Item = <B as Append>::Element>,
@@ -74,6 +75,7 @@ impl Column {
         Ok(())
     }
 
+    #[inline(always)]
     pub(crate) fn write_values<B: ArrayBuilder + Append + Send>(
         &mut self,
         mut values: &[<B as Append>::Element],
