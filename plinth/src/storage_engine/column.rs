@@ -1,9 +1,12 @@
 use arrow::array::{Array, ArrayBuilder};
 use std::{marker::PhantomData, sync::Arc};
 
-use crate::storage_engine::{
-    chunk::{Append, ChunkWriter, FrozenChunk, MutableChunk},
-    units::VersionID,
+use crate::{
+    storage_engine::chunk::AppendableType,
+    storage_engine::{
+        chunk::{Append, ChunkWriter, FrozenChunk, MutableChunk},
+        units::VersionID,
+    },
 };
 
 #[derive(Debug)]
@@ -13,7 +16,7 @@ pub struct Column {
     head: Option<Arc<FrozenChunk>>,
     frozen_tail: Option<Arc<FrozenChunk>>,
     tail: Option<MutableChunk>,
-    next_version: Box<dyn Fn() -> VersionID>,
+    next_version: Box<dyn Fn() -> VersionID + Send>,
     // `Column` is intentionally !Sync. Synchronization must be provided by
     // the owner when accessing it concurrently.
     _marker: PhantomData<*const ()>,
@@ -21,7 +24,7 @@ pub struct Column {
 
 impl Column {
     pub(crate) fn new<B: ArrayBuilder>(
-        next_version: Box<dyn Fn() -> VersionID>,
+        next_version: Box<dyn Fn() -> VersionID + Send>,
         builder: B,
     ) -> Self {
         Self {
@@ -34,11 +37,11 @@ impl Column {
     }
 
     #[inline(always)]
-    pub(crate) fn write<B: ArrayBuilder + Append + Send>(
+    pub(crate) fn write<V: AppendableType + Send>(
         &mut self,
-        values: impl Iterator<Item = <B as Append>::Element>,
+        values: impl Iterator<Item = <<V as AppendableType>::Builder as Append<V>>::Element>,
     ) -> Result<(), InvalidDowncast> {
-        let mut writer: ChunkWriter<B> = match self
+        let mut writer: ChunkWriter<V> = match self
             .tail
             .take()
             .expect("Impossible to fail since we manually set a MutableChunks")
@@ -76,9 +79,9 @@ impl Column {
     }
 
     #[inline(always)]
-    pub(crate) fn write_values<B: ArrayBuilder + Append + Send>(
+    pub(crate) fn write_values<B: AppendableType + Send>(
         &mut self,
-        mut values: &[<B as Append>::Element],
+        mut values: &[<<B as AppendableType>::Builder as Append<B>>::Element],
     ) -> Result<(), InvalidDowncast> {
         let mut writer: ChunkWriter<B> = match self
             .tail
@@ -162,15 +165,15 @@ unsafe impl Send for Column {}
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use arrow::array::{Array, Float32Builder, Int64Array, Int64Builder};
+    use arrow::array::{Array, Int64Array};
 
     use crate::storage_engine::{
-        chunk::CHUNK_SIZE,
+        chunk::{AppendableType, CHUNK_SIZE},
         column::{Column, InvalidDowncast},
         units::VersionID,
     };
 
-    fn version_generator() -> Box<dyn Fn() -> VersionID> {
+    fn version_generator() -> Box<dyn Fn() -> VersionID + Send> {
         let next_id: AtomicU64 = AtomicU64::new(0);
 
         Box::new(move || VersionID::new(next_id.fetch_add(1, Ordering::Relaxed)))
@@ -178,7 +181,7 @@ mod tests {
 
     #[test]
     fn new_column_has_mutable_tail() {
-        let column = Column::new(version_generator(), Int64Builder::new());
+        let column = Column::new(version_generator(), i64::builder());
 
         assert!(column.read_frozen().is_none());
 
@@ -191,10 +194,10 @@ mod tests {
 
     #[test]
     fn mutable_snapshot_reflects_current_state() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
         column
-            .write::<Int64Builder>([10, 20, 30].into_iter())
+            .write::<i64>([10i64, 20i64, 30i64].into_iter())
             .unwrap();
 
         let snapshot = column.read_mutable().expect("mutable tail should exist");
@@ -209,15 +212,13 @@ mod tests {
 
     #[test]
     fn mutable_snapshot_is_point_in_time() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
-        column
-            .write::<Int64Builder>([10, 20, 30].into_iter())
-            .unwrap();
+        column.write::<i64>([10, 20, 30].into_iter()).unwrap();
 
         let first = column.read_mutable().expect("mutable tail should exist");
 
-        column.write::<Int64Builder>([40, 50].into_iter()).unwrap();
+        column.write::<i64>([40, 50].into_iter()).unwrap();
 
         let second = column.read_mutable().expect("mutable tail should exist");
 
@@ -231,9 +232,9 @@ mod tests {
 
     #[test]
     fn writing_less_than_chunk_size_keeps_data_mutable() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
-        column.write::<Int64Builder>(0..100).unwrap();
+        column.write::<i64>(0..100).unwrap();
 
         assert!(column.read_frozen().is_none());
 
@@ -244,11 +245,9 @@ mod tests {
 
     #[test]
     fn filling_chunk_publishes_frozen_chunk_and_creates_new_tail() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
-        column
-            .write::<Int64Builder>(0..CHUNK_SIZE.get() as i64)
-            .unwrap();
+        column.write::<i64>(0..CHUNK_SIZE.get() as i64).unwrap();
 
         let frozen = column.read_frozen().expect("full chunk should be frozen");
 
@@ -268,11 +267,11 @@ mod tests {
 
     #[test]
     fn write_crossing_multiple_chunks_builds_correct_chain() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
         let total = CHUNK_SIZE.get() * 2 + 10;
 
-        column.write::<Int64Builder>(0..total as i64).unwrap();
+        column.write::<i64>(0..total as i64).unwrap();
 
         let first = column
             .read_frozen()
@@ -304,15 +303,13 @@ mod tests {
 
     #[test]
     fn frozen_chunks_preserve_insertion_order() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
         let chunk_size = CHUNK_SIZE.get() as i64;
 
-        column.write::<Int64Builder>(0..chunk_size).unwrap();
+        column.write::<i64>(0..chunk_size).unwrap();
 
-        column
-            .write::<Int64Builder>(chunk_size..chunk_size * 2)
-            .unwrap();
+        column.write::<i64>(chunk_size..chunk_size * 2).unwrap();
 
         let first = column.read_frozen().unwrap();
         let second = first.next().unwrap();
@@ -335,11 +332,11 @@ mod tests {
 
     #[test]
     fn version_ids_are_generated_once_per_chunk() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
         let total = CHUNK_SIZE.get() * 3;
 
-        column.write::<Int64Builder>(0..total as i64).unwrap();
+        column.write::<i64>(0..total as i64).unwrap();
 
         let first = column.read_frozen().unwrap();
         let second = first.next().unwrap();
@@ -356,11 +353,11 @@ mod tests {
 
     #[test]
     fn partial_final_chunk_remains_mutable() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
         let total = CHUNK_SIZE.get() + 123;
 
-        column.write::<Int64Builder>(0..total as i64).unwrap();
+        column.write::<i64>(0..total as i64).unwrap();
 
         let frozen = column.read_frozen().expect("first chunk should be frozen");
 
@@ -378,10 +375,10 @@ mod tests {
 
     #[test]
     fn write_values_less_than_chunk_size_keeps_data_mutable() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
         let values: Vec<i64> = (0..100).collect();
-        column.write_values::<Int64Builder>(&values).unwrap();
+        column.write_values::<i64>(&values).unwrap();
 
         assert!(column.read_frozen().is_none());
         assert_eq!(column.read_mutable().unwrap().len(), 100);
@@ -389,9 +386,9 @@ mod tests {
 
     #[test]
     fn write_values_snapshot_reflects_written_data() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
-        column.write_values::<Int64Builder>(&[10, 20, 30]).unwrap();
+        column.write_values::<i64>(&[10, 20, 30]).unwrap();
 
         let snapshot = column
             .read_mutable()
@@ -407,12 +404,12 @@ mod tests {
 
     #[test]
     fn write_values_snapshot_is_point_in_time() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
-        column.write_values::<Int64Builder>(&[10, 20, 30]).unwrap();
+        column.write_values::<i64>(&[10, 20, 30]).unwrap();
         let first = column.read_mutable().unwrap();
 
-        column.write_values::<Int64Builder>(&[40, 50]).unwrap();
+        column.write_values::<i64>(&[40, 50]).unwrap();
         let second = column.read_mutable().unwrap();
 
         let first = first.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -424,10 +421,10 @@ mod tests {
 
     #[test]
     fn write_values_filling_chunk_publishes_frozen() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
         let values: Vec<i64> = (0..CHUNK_SIZE.get() as i64).collect();
-        column.write_values::<Int64Builder>(&values).unwrap();
+        column.write_values::<i64>(&values).unwrap();
 
         let frozen = column.read_frozen().expect("full chunk should be frozen");
 
@@ -441,11 +438,11 @@ mod tests {
 
     #[test]
     fn write_values_crossing_multiple_chunks_builds_chain() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
         let total = CHUNK_SIZE.get() * 2 + 10;
         let values: Vec<i64> = (0..total as i64).collect();
-        column.write_values::<Int64Builder>(&values).unwrap();
+        column.write_values::<i64>(&values).unwrap();
 
         let first = column
             .read_frozen()
@@ -468,11 +465,11 @@ mod tests {
 
     #[test]
     fn write_values_preserves_insertion_order() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
         let chunk_size = CHUNK_SIZE.get() as i64;
         let values: Vec<i64> = (0..chunk_size * 2).collect();
-        column.write_values::<Int64Builder>(&values).unwrap();
+        column.write_values::<i64>(&values).unwrap();
 
         let first = column.read_frozen().unwrap();
         let second = first.next().unwrap();
@@ -494,10 +491,10 @@ mod tests {
 
     #[test]
     fn write_values_version_ids_per_chunk() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
         let values: Vec<i64> = (0..CHUNK_SIZE.get() as i64 * 3).collect();
-        column.write_values::<Int64Builder>(&values).unwrap();
+        column.write_values::<i64>(&values).unwrap();
 
         let first = column.read_frozen().unwrap();
         let second = first.next().unwrap();
@@ -512,11 +509,11 @@ mod tests {
 
     #[test]
     fn write_values_partial_final_chunk_remains_mutable() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
         let total = CHUNK_SIZE.get() + 123;
         let values: Vec<i64> = (0..total as i64).collect();
-        column.write_values::<Int64Builder>(&values).unwrap();
+        column.write_values::<i64>(&values).unwrap();
 
         let frozen = column.read_frozen().expect("first chunk should be frozen");
         assert_eq!(
@@ -528,9 +525,9 @@ mod tests {
 
     #[test]
     fn write_values_wrong_type_returns_invalid_downcast() {
-        let mut column = Column::new(version_generator(), Int64Builder::new());
+        let mut column = Column::new(version_generator(), i64::builder());
 
-        let result = column.write_values::<Float32Builder>(&[1.0, 2.0, 3.0]);
+        let result = column.write_values::<f32>(&[1.0, 2.0, 3.0]);
 
         assert!(
             matches!(result, Err(InvalidDowncast)),
