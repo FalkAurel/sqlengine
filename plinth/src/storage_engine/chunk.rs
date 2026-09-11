@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use arrow::array::{Array, ArrayBuilder, ArrowPrimitiveType, BooleanBuilder, PrimitiveBuilder};
+use arrow::array::{Array, ArrayBuilder};
 
 use crate::storage_engine::{
     units::{LogicalSize, VersionID},
@@ -101,23 +101,21 @@ impl MutableChunk {
             .finish_cloned()
     }
 
-    pub(crate) fn builder<B: ArrayBuilder + sealed::Append + Send>(
-        mut self,
-    ) -> Result<ChunkWriter<B>, Self> {
+    pub(crate) fn builder<B: AppendableType>(mut self) -> Result<ChunkWriter<B>, Self> {
         let builder: &dyn ArrayBuilder = self
             .builder
             .as_deref()
             .expect("MutableChunk builder must be present before type resolution");
 
-        if builder.as_any().is::<B>() {
+        if builder.as_any().is::<B::Builder>() {
             // Check the type before consuming the type-erased builder so that
             // we can safely recover the concrete builder below.
-            let builder: Box<B> = self
+            let builder: Box<B::Builder> = self
                 .builder
                 .take()
                 .expect("MutableChunk builder must be present after successful type check")
                 .into_box_any()
-                .downcast::<B>()
+                .downcast::<B::Builder>()
                 .expect("builder type must match the type checked above");
 
             Ok(ChunkWriter {
@@ -129,7 +127,7 @@ impl MutableChunk {
         }
     }
 
-    pub(crate) fn from<B: ArrayBuilder + sealed::Append + Send>(writer: ChunkWriter<B>) -> Self {
+    pub(crate) fn from<B: AppendableType>(writer: ChunkWriter<B>) -> Self {
         Self {
             builder: Some(writer.builder),
             chunk_id: writer.chunk_id,
@@ -137,12 +135,12 @@ impl MutableChunk {
     }
 }
 
-pub(crate) struct ChunkWriter<B: ArrayBuilder + sealed::Append + Send> {
-    builder: Box<B>,
+pub(crate) struct ChunkWriter<B: AppendableType> {
+    builder: Box<B::Builder>,
     chunk_id: VersionID,
 }
 
-impl<B: ArrayBuilder + sealed::Append> ChunkWriter<B> {
+impl<B: AppendableType> ChunkWriter<B> {
     /// Appends a value to the chunk, consuming the value before checking
     /// whether the chunk has reached `CHUNK_SIZE`.
     ///
@@ -161,7 +159,10 @@ impl<B: ArrayBuilder + sealed::Append> ChunkWriter<B> {
     /// to `append` is inserted exactly once, and `Err` means that the
     /// insertion just completed the chunk.
     #[inline(always)]
-    pub(crate) fn append(mut self, value: B::Element) -> Result<Self, (Box<B>, VersionID)> {
+    pub(crate) fn append(
+        mut self,
+        value: <<B as AppendableType>::Builder as Append<B>>::Element,
+    ) -> Result<Self, (Box<B::Builder>, VersionID)> {
         debug_assert!(
             self.builder.len() < CHUNK_SIZE.get() as usize,
             "State Machine should never enter a state where we have a full buffer but keep writing to it."
@@ -176,10 +177,18 @@ impl<B: ArrayBuilder + sealed::Append> ChunkWriter<B> {
     }
 
     #[allow(clippy::type_complexity)]
+    #[inline(always)]
     pub(crate) fn append_values(
         mut self,
-        values: &[B::Element],
-    ) -> Result<Self, (Box<B>, VersionID, &[B::Element])> {
+        values: &[<<B as AppendableType>::Builder as Append<B>>::Element],
+    ) -> Result<
+        Self,
+        (
+            Box<B::Builder>,
+            VersionID,
+            &[<<B as AppendableType>::Builder as Append<B>>::Element],
+        ),
+    > {
         debug_assert!(
             self.builder.len() < CHUNK_SIZE.get() as usize,
             "State Machine should never enter a state where we have a full buffer but keep writing to it."
@@ -187,7 +196,7 @@ impl<B: ArrayBuilder + sealed::Append> ChunkWriter<B> {
 
         let capacity: usize = CHUNK_SIZE.get() as usize - self.builder.len();
         let (written, returnable) = values.split_at(values.len().min(capacity));
-        Append::append_values(self.builder.as_mut(), written);
+        self.builder.append_values(written);
 
         if self.builder.len() == CHUNK_SIZE.get() as usize {
             Err((self.builder, self.chunk_id, returnable))
@@ -197,37 +206,178 @@ impl<B: ArrayBuilder + sealed::Append> ChunkWriter<B> {
     }
 }
 
-pub(crate) use sealed::Append;
-mod sealed {
-    pub(crate) trait Append {
-        type Element;
-        fn append(&mut self, value: Self::Element);
-        fn append_values(&mut self, values: &[Self::Element]);
-    }
+/// Describes how a builder appends values of type `V`.
+///
+/// The trait is parameterised on `V` so that one concrete Arrow builder can
+/// handle multiple logical types. The canonical example is a builder serving
+/// both `T` (non-nullable) and `Option<T>` (nullable): both map to the same
+/// Arrow builder but produce different element types and different append
+/// behaviour.
+///
+/// # Relationship with [`AppendableType`]
+///
+/// [`AppendableType`] goes from type → builder. `Append<V>` goes from builder
+/// → behaviour for `V`. The two form a closed loop:
+///
+/// ```text
+/// V: AppendableType  =>  V::Builder: ArrayBuilder + Append<V>
+/// ```
+///
+/// # Implementing for a custom type
+///
+/// The most common case is mapping a newtype wrapper onto an existing Arrow
+/// builder so no new builder type is needed:
+///
+/// ```no_run
+/// use arrow::array::Int64Builder;
+/// use plinth::{Append, AppendableType};
+///
+/// struct Metres(i64);
+///
+/// impl AppendableType for Metres {
+///     type Builder = Int64Builder;
+///     fn builder() -> Int64Builder { Int64Builder::new() }
+/// }
+///
+/// impl Append<Metres> for Int64Builder {
+///     type Element = Metres;
+///
+///     fn append(&mut self, v: Metres) {
+///         self.append_value(v.0);
+///     }
+///
+///     fn append_values(&mut self, vs: &[Metres]) {
+///         for v in vs {
+///             self.append_value(v.0);
+///         }
+///     }
+/// }
+/// ```
+///
+/// Prefer bulk Arrow operations (`append_slice`, `extend`) over element-wise
+/// loops inside `append_values` wherever the builder exposes them.
+pub trait Append<V: AppendableType> {
+    /// The value type consumed per insertion.
+    ///
+    /// For non-nullable types this is `V` itself. For nullable wrappers like
+    /// `Option<T>` it is `Option<T::Element>`.
+    type Element: Send;
+
+    /// Appends a single value to the builder.
+    fn append(&mut self, value: Self::Element);
+
+    /// Appends a contiguous slice of values to the builder.
+    fn append_values(&mut self, values: &[Self::Element]);
 }
 
-impl<T: ArrowPrimitiveType> sealed::Append for PrimitiveBuilder<T> {
-    type Element = <T as ArrowPrimitiveType>::Native;
+/// Associates a Rust type with the Arrow builder that stores it.
+///
+/// Implementing this trait makes a type usable as a column type in a
+/// [`Table`]. The engine resolves the correct builder at compile time through
+/// the associated `Builder` type, so a type mismatch between a column
+/// declaration and a write call is a compile error, not a runtime panic.
+///
+/// # Relationship with [`Append`]
+///
+/// `AppendableType` names the builder; [`Append<Self>`] teaches that builder
+/// how to accept values of this type. Both must be implemented together.
+///
+/// # Built-in implementations
+///
+/// All Arrow primitive scalars and their nullable counterparts are provided
+/// out of the box:
+///
+/// | Rust type              | Arrow builder     |
+/// |------------------------|-------------------|
+/// | `bool` / `Option<bool>`| `BooleanBuilder`  |
+/// | `i8` … `i64` (and `Option`) | `Int{8,16,32,64}Builder` |
+/// | `u8` … `u64` (and `Option`) | `UInt{8,16,32,64}Builder` |
+/// | `f32` / `f64` (and `Option`) | `Float{32,64}Builder` |
+///
+/// # Implementing for a custom type
+///
+/// ```no_run
+/// use arrow::array::Int64Builder;
+/// use plinth::{Append, AppendableType};
+///
+/// struct Metres(i64);
+///
+/// // Step 1 — teach Int64Builder to accept Metres
+/// impl Append<Metres> for Int64Builder {
+///     type Element = Metres;
+///     fn append(&mut self, v: Metres) { self.append_value(v.0); }
+///     fn append_values(&mut self, vs: &[Metres]) {
+///         for v in vs { self.append_value(v.0); }
+///     }
+/// }
+///
+/// // Step 2 — register Metres as a column-capable type
+/// impl AppendableType for Metres {
+///     type Builder = Int64Builder;
+///     fn builder() -> Int64Builder { Int64Builder::new() }
+/// }
+/// ```
+///
+/// If you also want nullable support, repeat both impls for `Option<Metres>`,
+/// keeping `type Builder = Int64Builder`.
+///
+/// [`Table`]: crate::storage_engine::table::Table
+pub trait AppendableType: Send + Sized {
+    /// The Arrow builder used to accumulate values of this type.
+    type Builder: ArrayBuilder + Append<Self>;
 
-    fn append(&mut self, value: Self::Element) {
-        self.append_value(value);
-    }
-
-    fn append_values(&mut self, values: &[Self::Element]) {
-        self.append_slice(values);
-    }
+    /// Returns a fresh, empty builder instance.
+    fn builder() -> Self::Builder;
 }
 
-impl sealed::Append for BooleanBuilder {
-    type Element = bool;
+mod primitive_impls {
+    use arrow::array::{
+        BooleanBuilder, Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder,
+        Int64Builder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
+    };
 
-    fn append(&mut self, value: Self::Element) {
-        BooleanBuilder::append_value(self, value);
+    use super::{Append, AppendableType};
+
+    macro_rules! impl_primitive_appendable {
+        ($(($native:ty, $builder:ty)),* $(,)?) => {
+            $(
+                impl AppendableType for $native {
+                    type Builder = $builder;
+                    fn builder() -> Self::Builder { <$builder>::new() }
+                }
+                impl AppendableType for Option<$native> {
+                    type Builder = $builder;
+                    fn builder() -> Self::Builder { <$builder>::new() }
+                }
+                impl Append<$native> for $builder {
+                    type Element = $native;
+                    fn append(&mut self, value: $native) { self.append_value(value); }
+                    fn append_values(&mut self, values: &[$native]) { self.append_slice(values); }
+                }
+                impl Append<Option<$native>> for $builder {
+                    type Element = Option<$native>;
+                    fn append(&mut self, value: Option<$native>) { self.append_option(value); }
+                    fn append_values(&mut self, values: &[Option<$native>]) {
+                        for &value in values { self.append_option(value); }
+                    }
+                }
+            )*
+        };
     }
 
-    fn append_values(&mut self, values: &[Self::Element]) {
-        self.append_slice(values);
-    }
+    impl_primitive_appendable!(
+        (bool, BooleanBuilder),
+        (i8, Int8Builder),
+        (i16, Int16Builder),
+        (i32, Int32Builder),
+        (i64, Int64Builder),
+        (u8, UInt8Builder),
+        (u16, UInt16Builder),
+        (u32, UInt32Builder),
+        (u64, UInt64Builder),
+        (f32, Float32Builder),
+        (f64, Float64Builder),
+    );
 }
 
 #[cfg(test)]
@@ -235,16 +385,16 @@ mod test {
     use std::sync::Arc;
 
     use arrow::array::{
-        Array, ArrayBuilder, BooleanBuilder, Float32Array, Float32Builder, Int64Array, Int64Builder,
+        Array, ArrayBuilder, BooleanBuilder, Float32Array, Float32Builder, Int64Array,
     };
 
     use crate::storage_engine::{
-        chunk::{Append, CHUNK_SIZE, ChunkWriter, FrozenChunk, MutableChunk},
+        chunk::{AppendableType, CHUNK_SIZE, ChunkWriter, FrozenChunk, MutableChunk},
         units::{LogicalOffset, VersionID},
     };
 
-    fn unwrap_builder<B: ArrayBuilder + Append + Send>(chunk: MutableChunk) -> ChunkWriter<B> {
-        match chunk.builder::<B>() {
+    fn unwrap_builder<V: AppendableType>(chunk: MutableChunk) -> ChunkWriter<V> {
+        match chunk.builder::<V>() {
             Ok(writer) => writer,
             Err(_) => panic!("builder type resolution failed"),
         }
@@ -255,7 +405,7 @@ mod test {
         let builder: Box<dyn ArrayBuilder> = Box::new(Float32Builder::new());
         let mutable_chunk = MutableChunk::new(builder, VersionID::new(0));
 
-        let mut writer = unwrap_builder::<Float32Builder>(mutable_chunk);
+        let mut writer = unwrap_builder::<f32>(mutable_chunk);
 
         for value in 0..CHUNK_SIZE.get() - 1 {
             writer = writer
@@ -281,10 +431,10 @@ mod test {
 
     #[test]
     fn append_fills_exactly_one_chunk() {
-        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let builder: Box<dyn ArrayBuilder> = Box::new(Option::<i64>::builder());
         let mutable_chunk = MutableChunk::new(builder, VersionID::new(42));
 
-        let mut writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+        let mut writer = unwrap_builder::<i64>(mutable_chunk);
 
         for value in 0..CHUNK_SIZE.get() - 1 {
             writer = writer
@@ -303,20 +453,20 @@ mod test {
 
     #[test]
     fn builder_type_resolution_succeeds_for_matching_type() {
-        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let builder: Box<dyn ArrayBuilder> = Box::new(i64::builder());
         let mutable_chunk = MutableChunk::new(builder, VersionID::new(7));
 
-        let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+        let writer = unwrap_builder::<i64>(mutable_chunk);
 
         assert_eq!(writer.builder.len(), 0);
     }
 
     #[test]
     fn builder_type_resolution_fails_for_wrong_type() {
-        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let builder: Box<dyn ArrayBuilder> = Box::new(i64::builder());
         let mutable_chunk = MutableChunk::new(builder, VersionID::new(7));
 
-        let result = mutable_chunk.builder::<Float32Builder>();
+        let result = mutable_chunk.builder::<f32>();
 
         assert!(
             result.is_err(),
@@ -330,24 +480,24 @@ mod test {
 
         // The original builder must still be available after a failed
         // type resolution.
-        let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+        let writer = unwrap_builder::<i64>(mutable_chunk);
 
         assert_eq!(writer.builder.len(), 0);
     }
 
     #[test]
     fn mutable_chunk_round_trip_preserves_builder() {
-        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let builder: Box<dyn ArrayBuilder> = Box::new(i64::builder());
         let mutable_chunk = MutableChunk::new(builder, VersionID::new(123));
 
-        let mut writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+        let mut writer = unwrap_builder::<i64>(mutable_chunk);
 
         writer = writer.append(10).unwrap();
         writer = writer.append(20).unwrap();
         writer = writer.append(30).unwrap();
 
         let mutable_chunk = MutableChunk::from(writer);
-        let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+        let writer = unwrap_builder::<i64>(mutable_chunk);
 
         assert_eq!(writer.builder.len(), 3);
     }
@@ -461,10 +611,10 @@ mod test {
 
     #[test]
     fn read_values() {
-        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let builder: Box<dyn ArrayBuilder> = Box::new(i64::builder());
         let mutable_chunk = MutableChunk::new(builder, VersionID::new(0));
 
-        let mut chunk_writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+        let mut chunk_writer = unwrap_builder::<i64>(mutable_chunk);
 
         for value in 0..CHUNK_SIZE.get() - 1 {
             chunk_writer = chunk_writer.append(value as i64).unwrap();
@@ -511,9 +661,9 @@ mod test {
 
     #[test]
     fn append_values_fits_within_chunk() {
-        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let builder: Box<dyn ArrayBuilder> = Box::new(i64::builder());
         let mutable_chunk = MutableChunk::new(builder, VersionID::new(0));
-        let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+        let writer = unwrap_builder::<i64>(mutable_chunk);
 
         let values: Vec<i64> = (0..10).collect();
         let writer = writer
@@ -525,9 +675,9 @@ mod test {
 
     #[test]
     fn append_values_exactly_fills_chunk() {
-        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let builder: Box<dyn ArrayBuilder> = Box::new(i64::builder());
         let mutable_chunk = MutableChunk::new(builder, VersionID::new(7));
-        let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+        let writer = unwrap_builder::<i64>(mutable_chunk);
 
         let values: Vec<i64> = (0..CHUNK_SIZE.get() as i64).collect();
         let (finished_builder, version_id, remainder) = match writer.append_values(&values) {
@@ -542,9 +692,9 @@ mod test {
 
     #[test]
     fn append_values_overflow_returns_remaining() {
-        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let builder: Box<dyn ArrayBuilder> = Box::new(i64::builder());
         let mutable_chunk = MutableChunk::new(builder, VersionID::new(3));
-        let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+        let writer = unwrap_builder::<i64>(mutable_chunk);
 
         let overflow = 5usize;
         let values: Vec<i64> = (0..CHUNK_SIZE.get() as i64 + overflow as i64).collect();
@@ -561,9 +711,9 @@ mod test {
 
     #[test]
     fn append_values_overflow_from_partial_chunk() {
-        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let builder: Box<dyn ArrayBuilder> = Box::new(i64::builder());
         let mutable_chunk = MutableChunk::new(builder, VersionID::new(5));
-        let mut writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+        let mut writer = unwrap_builder::<i64>(mutable_chunk);
 
         let pre_filled = 10usize;
         for v in 0..pre_filled as i64 {
@@ -585,9 +735,9 @@ mod test {
 
     #[test]
     fn append_values_empty_slice_is_noop() {
-        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let builder: Box<dyn ArrayBuilder> = Box::new(i64::builder());
         let mutable_chunk = MutableChunk::new(builder, VersionID::new(0));
-        let writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+        let writer = unwrap_builder::<i64>(mutable_chunk);
 
         let writer = writer
             .append_values(&[])
@@ -601,7 +751,7 @@ mod test {
         let builder: Box<dyn ArrayBuilder> = Box::new(BooleanBuilder::new());
         let mutable_chunk = MutableChunk::new(builder, VersionID::new(0));
 
-        let mut writer = unwrap_builder::<BooleanBuilder>(mutable_chunk);
+        let mut writer = unwrap_builder::<bool>(mutable_chunk);
 
         writer = writer.append(true).unwrap();
         writer = writer.append(false).unwrap();
@@ -612,10 +762,10 @@ mod test {
 
     #[test]
     fn chunk_id_survives_mutable_to_frozen_transition() {
-        let builder: Box<dyn ArrayBuilder> = Box::new(Int64Builder::new());
+        let builder: Box<dyn ArrayBuilder> = Box::new(i64::builder());
         let mutable_chunk = MutableChunk::new(builder, VersionID::new(1234));
 
-        let mut writer = unwrap_builder::<Int64Builder>(mutable_chunk);
+        let mut writer = unwrap_builder::<i64>(mutable_chunk);
 
         for value in 0..CHUNK_SIZE.get() - 1 {
             writer = writer.append(value as i64).unwrap();
