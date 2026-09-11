@@ -9,7 +9,7 @@ use crate::{
     units::VersionID,
 };
 
-fn version_generator() -> Box<dyn Fn() -> VersionID> {
+fn version_generator() -> Box<dyn Fn() -> VersionID + Send> {
     let next_id: AtomicU64 = AtomicU64::new(0);
 
     Box::new(move || VersionID::new(next_id.fetch_add(1, Ordering::Relaxed)))
@@ -37,7 +37,7 @@ pub fn bench_column_write(c: &mut Criterion) {
 
                 let values = (0..size as i32).map(black_box);
 
-                column.write::<Int32Builder>(values).unwrap();
+                column.write::<i32>(values).unwrap();
 
                 black_box(column);
             });
@@ -64,7 +64,7 @@ pub fn bench_column_write_values(c: &mut Criterion) {
             b.iter(|| {
                 let mut column: Column = make_column(Int32Builder::new());
                 column
-                    .write_values::<Int32Builder>(black_box(&values))
+                    .write_values::<i32>(black_box(&values))
                     .unwrap();
                 black_box(column);
             });
@@ -153,7 +153,7 @@ pub fn profile_append_1m() {
 
     let values = (0..1_048_576i32).map(std::hint::black_box);
 
-    column.write::<Int32Builder>(values).unwrap();
+    column.write::<i32>(values).unwrap();
 
     std::hint::black_box(column);
 }
@@ -163,7 +163,7 @@ pub fn profile_append_64k() {
 
     let values = (0..65_536i32).map(std::hint::black_box);
 
-    column.write::<Int32Builder>(values).unwrap();
+    column.write::<i32>(values).unwrap();
 
     std::hint::black_box(column);
 }
