@@ -230,9 +230,14 @@ impl<B: AppendableType> ChunkWriter<B> {
 ///
 /// ```no_run
 /// use arrow::array::Int64Builder;
-/// use plinth::storage_engine::chunk::{Append, AppendableType};
+/// use plinth::{Append, AppendableType};
 ///
 /// struct Metres(i64);
+///
+/// impl AppendableType for Metres {
+///     type Builder = Int64Builder;
+///     fn builder() -> Int64Builder { Int64Builder::new() }
+/// }
 ///
 /// impl Append<Metres> for Int64Builder {
 ///     type Element = Metres;
@@ -293,7 +298,7 @@ pub trait Append<V: AppendableType> {
 ///
 /// ```no_run
 /// use arrow::array::Int64Builder;
-/// use plinth::storage_engine::chunk::{Append, AppendableType};
+/// use plinth::{Append, AppendableType};
 ///
 /// struct Metres(i64);
 ///
