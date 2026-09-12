@@ -24,3 +24,7 @@ criterion = { version = "0.8.2", optional = true }
 [[bench]]
 name = "column"
 harness = false
+
+[[bench]]
+name = "table"
+harness = false

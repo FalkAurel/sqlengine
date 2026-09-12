@@ -1,5 +1,6 @@
 pub(crate) mod chunk;
 pub(crate) mod column;
+pub mod table;
 pub(crate) mod units;
 pub(crate) mod utility;
 pub(crate) mod vector;
