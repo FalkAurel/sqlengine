@@ -4,19 +4,21 @@ date: 2026-09-13
 excerpt: "This summer I interned at SAP's ABAP SQL Kernel team, extended a production SQL engine in C++, and cut query execution time by 75%. My supervisor told me my abilities far exceeded expectations. So I went home and started building my own storage engine in Rust — bottom-up, layer by layer. This is the first post in that series."
 ---
 
-This summer I interned at SAP's ABAP SQL Kernel team. I spent three months extending a production SQL engine in C++ — adding support for non-trivial `GROUP BY` operands, `HAVING` filters, `DISTINCT COUNT`, and common subexpression elimination. By the end, some query paths were 75% faster.
+This summer I interned at SAP's ABAP SQL Kernel team. Three months in a production C++ codebase, extending the SQL engine: `GROUP BY` already existed for raw columns, but I extended it to work on arbitrary expressions like `(A+B)+(C+D)`. I also implemented `HAVING`, `DISTINCT`, `DISTINCT COUNT`, and common subexpression elimination from scratch. Queries that previously had to be pushed down to HANA could now execute entirely on the application server — up to 75% faster as a result. My supervisor was impressed enough to offer to take me on for my bachelor thesis.
 
-My supervisor's written feedback included: *"Knowledge and skills far exceed expectations for a dual-study student in their first practical phase."*
+That part was great. What wasn't great was the codebase.
 
-That was the push I needed. If the ceiling is that far away, I want to find out where it is.
+Legacy C++, function macros that made you question your life choices, decades of accumulated decisions that made sense in isolation but compounded into something you had to fight every time you wanted to add something clean. I don't say this to be ungrateful — the work was genuinely interesting and the team was excellent. But by the end of the summer I had a very clear thought: I know what this should look like. I can build it better. In Rust, from scratch, without the legacy baggage.
 
-I'm 21. I'm building a storage engine in Rust from scratch — and when it's done, I'm going to build a full ISO-compliant SQL engine on top of it. This is the first post in that series.
+I'm 21. I've read the Codd paper, the Garcia-Molina textbook, the concurrency literature. I had spent a summer inside a real SQL kernel. So that's what I'm doing — and fair warning, I'm not going to skip the parts where I was debugging at 2am wondering if I'd made a fundamental mistake.
+
+Storage engine first. Then snapshots. Then MVCC. Then a full ISO-compliant SQL engine on top. This is the first post in that series.
 
 ---
 
-## The Plan
+## The Stack
 
-The stack I'm building, bottom up:
+Bottom up:
 
 ```text
 SQL Engine          ← future
@@ -28,23 +30,23 @@ Storage Engine      ← this post
  Apache Arrow       ← backing format
 ```
 
-Each layer has a design document before a line of code is written. The design documents live alongside the implementation in the repo. This post is about the storage engine layer.
+Each layer gets a design document before a line of code is written. That habit came from SAP — the feedback specifically mentioned architectural thinking — and it already saved me from a significant mistake I'll get to at the end of this post. The design docs live in the repo alongside the code.
 
 ---
 
-## Why Apache Arrow as the Backing Format?
+## Why Arrow?
 
-Arrow is a columnar in-memory format with zero-copy reads, SIMD-friendly layout, and a mature Rust implementation. Using it as the physical layer means I'm not reinventing buffer management — I'm building above it.
+I didn't want to design a memory layout. Arrow gives you a columnar in-memory format with zero-copy reads, SIMD-friendly structure, and a mature Rust implementation. Building above it means I start with buffer management solved and can focus on what's actually interesting.
 
-The relevant comparison is what DuckDB does. DuckDB uses Arrow-compatible columnar segments internally, which means full memory segments are never mutated. Readers can access data without synchronizing with writers. I want the same property, and starting from Arrow gets me there without having to design the memory layout myself.
+The model I was targeting is what DuckDB does: full memory segments are never mutated, so readers can access data without synchronizing with writers at all. Arrow gets me that property without designing it from scratch.
 
-The tradeoff is that I'm now at the mercy of Arrow's builder API, which turns out to matter more than I expected. More on that shortly.
+The tradeoff — and I knew this going in — is that I'm now coupled to Arrow's builder API. That coupling turned out to matter more than I expected. We'll get there.
 
 ---
 
 ## The Architecture
 
-The storage layer is a three-level hierarchy:
+Three levels:
 
 ```text
 Column
@@ -60,50 +62,43 @@ Column
              Arrow ArrayBuilder
 ```
 
-A `Column` owns a mutable tail chunk. When the tail fills (at 65,536 values), it's frozen — converted from a mutable Arrow builder into an immutable `Arc<dyn Array>` — and linked into the chain. New writes go into the next tail chunk.
+A `Column` owns a mutable tail chunk. When it fills at 65,536 values, it's frozen — the Arrow builder is finished into an `Arc<dyn Array>` and linked into the chain. Writes continue into a fresh tail.
 
-The frozen representation gives you the same guarantee DuckDB has: published data is immutable. A reader holding a reference to a frozen chunk can iterate it indefinitely without any coordination with a writer appending to the tail.
-
-The `FrozenChunk` stores an `Arc<dyn Array>`, so freezing does not copy data. It re-wraps what the Arrow builder already owns:
+Freezing doesn't copy anything. The builder already owns the memory; we just re-wrap it:
 
 ```rust
 let array: Arc<dyn Array> = Arc::new(builder.finish());
 let frozen = Arc::new(FrozenChunk::new(array, chunk_id));
 ```
 
-That's the only allocation at rollover time. The per-element path touches nothing outside the builder.
+One allocation at rollover. Nothing in the per-element path. And once a chunk is frozen, it's immutable forever — a reader holding a reference to it doesn't need to coordinate with anything.
+
+That last property is the whole point. It's what makes the MVCC design tractable. But I'm getting ahead of myself.
 
 ---
 
-## The 2× Slowdown I Did Not Expect
+## The 2× Slowdown, and Two Hours of Debugging at 2am
 
-Once I had a working `Column`, I benchmarked it against writing directly through a `ChunkWriter`. The result was surprising:
+Once the `Column` was working, I benchmarked it:
 
 ```text
 Direct ChunkWriter       ~1.1B elements/sec
 Column::write            ~530M elements/sec
 ```
 
-Roughly half the throughput. The `Column` abstraction looked lightweight — fully generic, statically dispatched, no `dyn` in the hot path. I expected the compiler to flatten it.
+Half the throughput. I stared at this for a long time.
 
-It mostly did. But not completely.
+The code looked right. Fully generic, statically dispatched, no `dyn` anywhere in the hot path. The whole point of Rust's monomorphization is that the compiler flattens this kind of layered abstraction into one tight loop. That's what I was counting on. That's what I would have bet on.
 
-### Ruling Out the Obvious Suspects
+I was wrong. And I did not figure out why until around 2am.
 
-I worked through the plausible explanations one by one:
+My first instinct — and this is where my expectations started working against me — was to look for `dyn`. Fat pointer, dynamic dispatch, vtable jump: that's the classic "this is slow" story in Rust. So I looked everywhere I was using `dyn`. I had a `Box<dyn Fn() -> VersionID>` for generating version IDs. I replaced it with a static atomic. No improvement. I looked at `Arc<dyn Array>` in the frozen chunks. That's only touched at rollover, once every 65,536 elements. Not the issue. I looked at the `impl Iterator` parameter. Static dispatch. Monomorphized. Not inherently expensive.
 
-| Suspect | Result |
-|---|---|
-| `Box<dyn Fn() -> VersionID>` for ID generation | Replaced with static atomic. No improvement. |
-| `Arc` reference counting | `Arc::clone` happens at rollover, not per element. Not the issue. |
-| Chunk rollover | Isolated test showed ~2% difference. Not the issue. |
-| `impl Iterator` parameter | Static dispatch. Monomorphized. Not inherently expensive. |
-| Per-element `black_box` in benchmark | Real ~10% artifact. Not the full gap. |
-| `#[inline(always)]` on `Column::write` | ~1–2% improvement. Not the issue. |
+Nothing. I was chasing fat pointers and there weren't any in the hot path. I had completely misidentified the category of problem.
 
-None of those explained 2×. So I looked at the assembly.
+Eventually I stopped guessing and read the assembly.
 
-### Reading the Machine Code
+### What objdump Showed
 
 ```bash
 cargo build --release --features bench --bin profile_column
@@ -111,37 +106,35 @@ nm -C -S target/release/profile_column | grep 'Column.*write'
 objdump -dC target/release/profile_column
 ```
 
-The hot loop in `Column::write` contained this:
+The hot loop:
 
 ```asm
 cmpq   $0x10000,0x10(%rbx)    ; check builder length < CHUNK_SIZE
 jae    ...
-mov    0x38(%rsp),%esi         ; load value
+mov    0x38(%rsp),%esi
 mov    %rbx,%rdi
-call   c50a0                   ; CALL Append::append
+call   c50a0                   ; <PrimitiveBuilder<Int32Type> as Append>::append
 cmpq   $0x10000,0x10(%rbx)    ; check builder length again
 jb     loop
 ```
 
-There's a real `call` instruction inside the per-element loop. The target was:
+There's a `call` instruction. Right there, inside the per-element loop. Every single element is paying a function call.
 
-```text
-<PrimitiveBuilder<Int32Type> as plinth::...::Append>::append
-```
-
-`ChunkWriter::append` had been inlined — there was no call to it. But the one step further down, the concrete `Append` implementation for `PrimitiveBuilder`, was not. Every element paid a full function call.
-
-At ~530M elements/sec, that's hundreds of millions of calls per second. The profiler agreed:
+The profiler had been pointing at exactly this all along:
 
 ```text
 59.67%  <PrimitiveBuilder<Int32Type> as Append>::append
 ```
 
-Source, profiler, and disassembly all pointed at the same place.
+I'd been reading that as "the append implementation is slow." It wasn't. It was that the append implementation was never being inlined — so every element crossed a function call boundary, and at 500M+ elements per second, that boundary is expensive.
 
-### Why the Compiler Wouldn't Inline It
+`ChunkWriter::append` had been inlined. The compiler did collapse that layer. But one level deeper — the concrete `Append` implementation for `PrimitiveBuilder` — survived as a real call. The abstraction mostly collapsed. One boundary didn't.
 
-The `Append` trait implementation sat behind an `Option<Box<B>>`:
+### The Actual Problem
+
+In hindsight, embarrassingly obvious. I was looking for `dyn` and fat pointers. The real issue was `Option<Box<B>>`.
+
+The builder lived behind an `Option`:
 
 ```rust
 struct MutableChunk {
@@ -149,18 +142,19 @@ struct MutableChunk {
 }
 ```
 
-Even in the generic, statically-dispatched path, the `Option<Box<B>>` wrapper forced the compiler to emit a null check on every iteration. That check blocked inlining because the compiler could not prove the pointer was always valid — even though the logic guaranteed it was.
+Even in the fully generic, statically-dispatched path, `Option<Box<B>>` means the compiler has to check on every iteration whether the pointer is null. It can't prove it's always valid — even though the logic guarantees it is — so it emits the check, and that check blocks inlining.
 
-The fix was to change the representation to `Box<B>` directly, giving the compiler the invariant that the pointer is always non-null:
+I was hunting vtables. The problem was an innocuous `Option` wrapper that broke the compiler's proof obligations.
+
+The fix: change the representation to `Box<B>` directly, so the compiler gets the non-null invariant for free:
 
 ```rust
 struct ChunkWriter<B> {
     builder: Box<B>,
-    // ...
 }
 ```
 
-And mark the `Append` implementation:
+And mark the `Append` implementation for inlining:
 
 ```rust
 #[inline(always)]
@@ -169,41 +163,47 @@ fn append(&mut self, value: i32) {
 }
 ```
 
-After the change, the `call c50a0` instruction disappeared from the hot loop. The assembly became what it should have been from the start: a tight sequence of inlined Arrow builder operations inside the iteration. The throughput closed the gap to near-parity with the direct `ChunkWriter` path.
+Rebuilt. Checked the assembly. The `call c50a0` was gone. The loop became a tight sequence of inlined Arrow builder operations, exactly what it should have been from the start.
 
-### The Lesson
-
-The lesson is not "traits are slow" or "generics are slow." `ChunkWriter::append` was inlined. The entire `Column` abstraction collapsed correctly. One boundary survived — and it did so because of a subtle type-level representation that blocked the compiler's proof obligations.
-
-> Source-level reasoning tells you what *should* happen. Disassembly tells you what *actually* happened.
-
-If you're writing performance-sensitive Rust and something is slower than it should be: profile with `perf`, find the hot symbol, read the machine code. The answer is usually precise and fixable. The debugging workflow that found this:
-
-```text
-Benchmark → isolate components → remove benchmark artifacts →
-perf/flamegraph → suspicious symbol → nm + objdump →
-match assembly to source → one targeted change → re-measure
-```
-
----
-
-## Where It Stands
-
-Current benchmark against raw Arrow primitives:
+### Where It Stands Now
 
 ```text
 Column::write         ~1.05B elements/sec
 Raw Arrow append      ~1.1B elements/sec
 ```
 
-Near-parity. The `Column` abstraction — with its frozen chunk chain, version IDs, and rollover logic — costs almost nothing compared to writing directly into an Arrow builder.
+Near-parity. The full `Column` abstraction — frozen chunk chain, version IDs, rollover — costs essentially nothing over writing directly into an Arrow builder.
+
+### What This Actually Taught Me
+
+Not "traits are slow." Not "generics are slow." Those would be wrong lessons. The abstraction was fine. Monomorphization worked. The compiler collapsed almost everything.
+
+The problem was a representation detail I hadn't thought through, and I spent hours not finding it because I was looking for the wrong thing. I knew what Rust performance problems looked like — fat pointers, dynamic dispatch, missed inlining on `dyn` — and I kept looking for that pattern even after the evidence stopped supporting it.
+
+> Your mental model of what's slow will blind you to what's actually slow.
+
+When you're stuck: stop reasoning from the source. Profile, find the hot symbol, read the machine code. The truth is in there and it's usually precise.
+
+---
+
+## The Design Mistake I Caught Before It Cost Me Any Code
+
+One more thing, because it's relevant to how this project is structured.
+
+I started the design phase at the top of the stack — with MVCC. That's where the interesting problems are: snapshot isolation, concurrent readers and writers, version visibility. I wrote the whole design document. Then I looked at it and realized I had nothing to implement it against. The design was correct in the abstract but had no foundation.
+
+So I stopped and went down. Storage engine first. Table API second. Now I'm back to MVCC with actual primitives to reason about.
+
+That wasn't an accident — it was the same instinct from SAP. Design before you code, and interrogate the design before you commit to it. The MVCC document is deliberately vague: no code, no data structures, just invariants and protocol. It could afford to be vague because it was never going to be implemented until the layers below it existed.
+
+The mistake was misjudging the scope. The catch was catching it in the design phase, which cost nothing, instead of in the implementation phase, which would have cost a lot.
 
 ---
 
 ## What's Next
 
-The storage engine layer is the foundation. The next post covers the **Table API**: a type-level schema system where the row type `T` describes its fields statically, and `Table<T>` owns all relational operations. No per-row heap allocation. No intermediate field collections. The schema is derived from `T`'s type, not from runtime introspection.
+The next post covers the **Table API**: a type-level schema where `T` describes its fields statically, `Table<T>` owns all relational operations, and insertion requires zero per-row heap allocation. No intermediate field collections. The schema is derived from `T`'s type at compile time.
 
-After that: snapshots, then MVCC — the layer I designed first, before I realized I needed the foundation underneath it first.
+After that: snapshots, then MVCC.
 
-The repo is at [github.com/FalkAurel/sqlengine](https://github.com/FalkAurel/sqlengine). The design documents live alongside the code.
+The repo is at [github.com/FalkAurel/sqlengine](https://github.com/FalkAurel/sqlengine). The design documents are in `design-docs/`.
