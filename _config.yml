@@ -1,0 +1,20 @@
+title: Julius Korbjuhn
+description: Building a storage engine from scratch — storage layer, MVCC, and a SQL engine to follow.
+url: "https://falkaurel.github.io"
+baseurl: "/sqlengine"
+
+permalink: /posts/:title/
+
+markdown: kramdown
+kramdown:
+  syntax_highlighter: rouge
+  syntax_highlighter_opts:
+    block:
+      line_numbers: false
+
+defaults:
+  - scope:
+      path: ""
+      type: posts
+    values:
+      layout: post

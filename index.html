@@ -1,0 +1,14 @@
+---
+layout: default
+title: Julius Korbjuhn
+---
+
+<ul class="post-list">
+  {% for post in site.posts %}
+  <li>
+    <a href="{{ post.url | relative_url }}">{{ post.title }}</a>
+    <div class="meta">{{ post.date | date: "%B %-d, %Y" }}</div>
+    {% if post.excerpt %}<div class="excerpt">{{ post.excerpt | strip_html | truncatewords: 30 }}</div>{% endif %}
+  </li>
+  {% endfor %}
+</ul>
