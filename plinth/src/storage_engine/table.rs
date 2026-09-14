@@ -1,10 +1,16 @@
 use std::{collections::HashMap, marker::PhantomData};
 
 use crate::{
-    storage_engine::{chunk::{Append, AppendableType}, column::{Column, InvalidDowncast}, table::{
-        schema::SchemaList,
-        sealed::{Index, IndexNotFound},
-    }, units::{LogicalOffset, VersionID}}, units::LogicalSize,
+    storage_engine::{
+        chunk::{Append, AppendableType},
+        column::{Column, InvalidDowncast},
+        table::{
+            schema::SchemaList,
+            sealed::{Index, IndexNotFound},
+        },
+        units::{LogicalOffset, VersionID},
+    },
+    units::LogicalSize,
 };
 
 mod sealed {
@@ -44,6 +50,11 @@ mod sealed {
     }
 }
 
+struct PendingWrite<'a> {
+    index: LogicalOffset,
+    callback: Box<dyn FnOnce(&mut Column) -> Result<(), InvalidDowncast> + 'a>,
+}
+
 #[derive(Debug)]
 pub enum VisitorError {
     IndexNotFound(IndexNotFound),
@@ -53,7 +64,10 @@ pub enum VisitorError {
     /// All columns in a streaming insert must yield the same number of values.
     /// The first column's iterator length is used as the expected length for
     /// all subsequent columns.
-    LengthMismatch { expected: LogicalSize, got: LogicalSize },
+    LengthMismatch {
+        expected: LogicalSize,
+        got: LogicalSize,
+    },
 }
 
 pub trait FieldVisitor {
@@ -77,11 +91,12 @@ pub trait FieldVisitor {
 /// When data is already in contiguous memory, prefer [`SliceFieldVisitor`]
 /// instead — it maps directly to Arrow's `append_slice` and is only memory
 /// bandwidth limited. For single-value writes, use [`FieldVisitor`].
-pub trait StreamingFieldVisitor {
-    fn visit_fields<I: Index, V: AppendableType>(
+pub trait StreamingFieldVisitor<'a> {
+    fn visit_fields<'iterator: 'a, I: Index, V: AppendableType>(
         &mut self,
         index: I,
-        values: impl ExactSizeIterator<Item = <<V as AppendableType>::Builder as Append<V>>::Element>,
+        values: impl ExactSizeIterator<Item = <<V as AppendableType>::Builder as Append<V>>::Element>
+        + 'iterator,
     ) -> Result<(), VisitorError>;
 }
 
@@ -96,11 +111,11 @@ pub trait StreamingFieldVisitor {
 /// This is the preferred path for transferring large amounts of data into the
 /// table. Use [`StreamingFieldVisitor`] when a contiguous slice is not
 /// available, or [`FieldVisitor`] for single-value writes.
-pub trait SliceFieldVisitor {
-    fn visit_slice<const N: usize, I: Index, V: AppendableType>(
+pub trait SliceFieldVisitor<'a> {
+    fn visit_slice<'slice: 'a, const N: usize, I: Index, V: AppendableType>(
         &mut self,
         index: I,
-        values: &[<<V as AppendableType>::Builder as Append<V>>::Element; N],
+        values: &'slice [<<V as AppendableType>::Builder as Append<V>>::Element; N],
     ) -> Result<(), VisitorError>;
 }
 
@@ -129,13 +144,23 @@ impl<'a, T: TableRow> FieldVisitor for SingleFieldVisitor<'a, T> {
 pub(crate) struct StreamingVisitor<'a, T: TableRow> {
     table: &'a mut Table<T>,
     expected_len: Option<LogicalSize>,
+    iterators: Vec<PendingWrite<'a>>,
 }
 
-impl<'a, T: TableRow> StreamingFieldVisitor for StreamingVisitor<'a, T> {
-    fn visit_fields<I: Index, V: AppendableType>(
+impl<'a, T: TableRow> StreamingVisitor<'a, T> {
+    fn commit(mut self) {
+        while let Some(PendingWrite { index, callback }) = self.iterators.pop() {
+            callback(T::get_column_mut(self.table, index).expect("The Index Resolution is cooked"))
+                .expect("Terminating Program: Datastorage has been corrupted. Verify if your index mapping is actually mapping to the right column type.")
+        }
+    }
+}
+impl<'a, T: TableRow> StreamingFieldVisitor<'a> for StreamingVisitor<'a, T> {
+    fn visit_fields<'iterator: 'a, I: Index, V: AppendableType>(
         &mut self,
         index: I,
-        values: impl ExactSizeIterator<Item = <<V as AppendableType>::Builder as Append<V>>::Element>,
+        values: impl ExactSizeIterator<Item = <<V as AppendableType>::Builder as Append<V>>::Element>
+        + 'iterator,
     ) -> Result<(), VisitorError> {
         let len: LogicalSize = LogicalSize::new(values.len() as u64);
 
@@ -147,35 +172,60 @@ impl<'a, T: TableRow> StreamingFieldVisitor for StreamingVisitor<'a, T> {
             _ => {}
         }
 
-        let index: LogicalOffset = index.resolve(self.table).map_err(VisitorError::IndexNotFound)?;
+        let index: LogicalOffset = index
+            .resolve(self.table)
+            .map_err(VisitorError::IndexNotFound)?;
 
-        self.table
-            .columns
-            .get_mut(index.get() as usize)
-            .expect("This shouldn't fail. Failing would mean that the index resolving is broken or our static table mapping is cooked")
-            .write::<V>(values)
-            .map_err(VisitorError::InvalidDowncast)
+        T::get_column_mut(self.table, index)
+            .unwrap()
+            .write::<V>(std::iter::empty())
+            .map_err(VisitorError::InvalidDowncast)?;
+
+        self.iterators.push(PendingWrite {
+            index,
+            callback: Box::new(move |column: &mut Column| column.write::<V>(values)),
+        });
+        Ok(())
     }
 }
 
 pub(crate) struct SliceVisitor<'a, T: TableRow> {
     table: &'a mut Table<T>,
+    iterators: Vec<PendingWrite<'a>>,
 }
 
-impl<'a, T: TableRow> SliceFieldVisitor for SliceVisitor<'a, T> {
-    fn visit_slice<const N: usize, I: Index, V: AppendableType>(
+impl<'a, T: TableRow> SliceVisitor<'a, T> {
+    fn commit(mut self) {
+        while let Some(PendingWrite { index, callback }) = self.iterators.pop() {
+            callback(T::get_column_mut(self.table, index).expect("The Index Resolution is cooked"))
+                .expect("Terminating Program: Datastorage has been corrupted. Verify if your index mapping is actually mapping to the right column type.")
+        }
+    }
+}
+
+impl<'a, T: TableRow> SliceFieldVisitor<'a> for SliceVisitor<'a, T> {
+    fn visit_slice<'slice: 'a, const N: usize, I: Index, V: AppendableType>(
         &mut self,
         index: I,
-        values: &[<<V as AppendableType>::Builder as Append<V>>::Element; N],
+        values: &'slice [<<V as AppendableType>::Builder as Append<V>>::Element; N],
     ) -> Result<(), VisitorError> {
-        let index: LogicalOffset = index.resolve(self.table).map_err(VisitorError::IndexNotFound)?;
+        let index: LogicalOffset = index
+            .resolve(self.table)
+            .map_err(VisitorError::IndexNotFound)?;
 
-        self.table
-            .columns
-            .get_mut(index.get() as usize)
-            .expect("This shouldn't fail. Failing would mean that the index resolving is broken or our static table mapping is cooked")
-            .write_values::<V>(values)
-            .map_err(VisitorError::InvalidDowncast)
+        T::get_column_mut(self.table, index)
+            .expect("Column Resolver is incorrect")
+            .write_values::<V>(&[])
+            .map_err(VisitorError::InvalidDowncast)?;
+
+        self.iterators.push(PendingWrite {
+            index,
+            callback: Box::new(move |column: &mut Column| -> Result<(), InvalidDowncast> {
+                column.write_values::<V>(values)
+            }),
+        });
+
+        Ok(())
     }
 }
 
@@ -191,6 +241,17 @@ impl<'a, T: TableRow> SliceFieldVisitor for SliceVisitor<'a, T> {
 /// more of [`RowInsert`], [`StreamingTableRow`], or [`SliceTableRow`].
 pub trait TableRow {
     type Schema: SchemaList;
+
+    #[allow(private_interfaces)]
+    fn get_column_mut<T: TableRow>(
+        table: &mut Table<T>,
+        offset: LogicalOffset,
+    ) -> Result<&mut Column, IndexNotFound> {
+        table
+            .columns
+            .get_mut(offset.as_usize())
+            .ok_or(IndexNotFound)
+    }
 }
 
 /// Single-row insertion path.
@@ -276,7 +337,7 @@ pub trait RowInsert: TableRow {
 /// }
 ///
 /// impl StreamingTableRow for UserStream {
-///     fn visit_columns_streaming<V: StreamingFieldVisitor>(self, visitor: &mut V) -> Result<(), VisitorError> {
+///     fn visit_columns_streaming<'a, V: StreamingFieldVisitor<'a>>(self, visitor: &mut V) -> Result<(), VisitorError> {
 ///         // ? exits early if lengths disagree — no partial writes.
 ///         visitor.visit_fields::<&str, i32>("id", self.ids)?;
 ///         visitor.visit_fields::<&str, u8>("age", self.ages)?;
@@ -297,7 +358,12 @@ pub trait RowInsert: TableRow {
 /// table.streaming_insert(stream).unwrap();
 /// ```
 pub trait StreamingTableRow: TableRow {
-    fn visit_columns_streaming<V: StreamingFieldVisitor>(self, visitor: &mut V) -> Result<(), VisitorError>;
+    fn visit_columns_streaming<'a, V: StreamingFieldVisitor<'a>>(
+        self,
+        visitor: &mut V,
+    ) -> Result<(), VisitorError>
+    where
+        Self: 'a;
 }
 
 /// Columnar extension of [`TableRow`] for bulk inserts from contiguous memory.
@@ -315,7 +381,7 @@ pub trait StreamingTableRow: TableRow {
 ///
 /// ```
 /// use plinth::storage_engine::table::{
-///     Empty, Node, SliceFieldVisitor, SliceTableRow, TableBuilder, TableRow,
+///     Empty, Node, SliceFieldVisitor, SliceTableRow, TableBuilder, TableRow, VisitorError
 /// };
 ///
 /// struct UserRow { id: i32, age: u8 }
@@ -347,12 +413,15 @@ pub trait StreamingTableRow: TableRow {
 /// }
 ///
 /// impl<const N: usize> SliceTableRow for UserBatch<N> {
-///     fn visit_columns_slice<V: SliceFieldVisitor>(&self, visitor: &mut V) {
+///     fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(&'a self, visitor: &mut V) -> Result<(), VisitorError> {
 ///         // For primitive types, each call maps to append_slice — a memcpy
 ///         // over the Arrow buffer. One downcast per column, no per-value cost.
 ///         // Equal length is guaranteed by N — no runtime length check needed.
-///         let _ = visitor.visit_slice::<N, &str, i32>("id", &*self.ids);
-///         let _ = visitor.visit_slice::<N, &str, u8>("age", &*self.ages);
+///         
+///         let _ = visitor.visit_slice::<N, &str, i32>("id", self.ids.as_ref());
+///         let _ = visitor.visit_slice::<N, &str, u8>("age", self.ages.as_ref());
+///
+///         Ok(())
 ///     }
 /// }
 ///
@@ -369,7 +438,10 @@ pub trait StreamingTableRow: TableRow {
 /// table.bulk_insert(&batch);
 /// ```
 pub trait SliceTableRow: TableRow {
-    fn visit_columns_slice<V: SliceFieldVisitor>(&self, visitor: &mut V);
+    fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(
+        &'a self,
+        visitor: &mut V,
+    ) -> Result<(), VisitorError>;
 }
 
 pub mod schema {
@@ -461,13 +533,28 @@ impl<T: TableRow> Table<T> {
         &mut self,
         source: S,
     ) -> Result<(), VisitorError> {
-        let mut visitor: StreamingVisitor<T> = StreamingVisitor { table: self, expected_len: None };
-        source.visit_columns_streaming(&mut visitor)
+        let mut visitor: StreamingVisitor<'_, T> = StreamingVisitor {
+            table: self,
+            iterators: Vec::new(),
+            expected_len: None,
+        };
+        source.visit_columns_streaming(&mut visitor)?;
+        visitor.commit();
+        Ok(())
     }
 
-    pub fn bulk_insert<S: SliceTableRow<Schema = T::Schema>>(&mut self, source: &S) {
-        let mut visitor: SliceVisitor<T> = SliceVisitor { table: self };
-        source.visit_columns_slice(&mut visitor);
+    pub fn bulk_insert<S: SliceTableRow<Schema = T::Schema>>(
+        &mut self,
+        source: &S,
+    ) -> Result<(), VisitorError> {
+        let mut visitor: SliceVisitor<T> = SliceVisitor {
+            table: self,
+            iterators: Vec::new(),
+        };
+        source.visit_columns_slice(&mut visitor)?;
+        visitor.commit();
+
+        Ok(())
     }
 }
 
@@ -497,7 +584,7 @@ mod test {
     }
 
     impl StreamingTableRow for UserStream {
-        fn visit_columns_streaming<V: StreamingFieldVisitor>(
+        fn visit_columns_streaming<'a, V: StreamingFieldVisitor<'a>>(
             self,
             visitor: &mut V,
         ) -> Result<(), VisitorError> {
@@ -575,7 +662,7 @@ mod test {
     }
 
     impl StreamingTableRow for WrongTypeStream {
-        fn visit_columns_streaming<V: StreamingFieldVisitor>(
+        fn visit_columns_streaming<'a, V: StreamingFieldVisitor<'a>>(
             self,
             visitor: &mut V,
         ) -> Result<(), VisitorError> {
@@ -605,7 +692,7 @@ mod test {
     }
 
     impl StreamingTableRow for BadStringIndexStream {
-        fn visit_columns_streaming<V: StreamingFieldVisitor>(
+        fn visit_columns_streaming<'a, V: StreamingFieldVisitor<'a>>(
             self,
             visitor: &mut V,
         ) -> Result<(), VisitorError> {
@@ -621,7 +708,7 @@ mod test {
     }
 
     impl StreamingTableRow for BadUsizeIndexStream {
-        fn visit_columns_streaming<V: StreamingFieldVisitor>(
+        fn visit_columns_streaming<'a, V: StreamingFieldVisitor<'a>>(
             self,
             visitor: &mut V,
         ) -> Result<(), VisitorError> {
@@ -698,8 +785,10 @@ mod test {
     #[test]
     fn insert_unknown_string_index_returns_index_not_found() {
         let mut table = TableBuilder::default()
-            .add::<i32>("id").unwrap()
-            .add::<u8>("age").unwrap()
+            .add::<i32>("id")
+            .unwrap()
+            .add::<u8>("age")
+            .unwrap()
             .finish::<InsertInvalidStringIndex>();
         table.insert(InsertInvalidStringIndex);
     }
@@ -707,8 +796,10 @@ mod test {
     #[test]
     fn insert_out_of_bounds_usize_index_returns_index_not_found() {
         let mut table = TableBuilder::default()
-            .add::<i32>("id").unwrap()
-            .add::<u8>("age").unwrap()
+            .add::<i32>("id")
+            .unwrap()
+            .add::<u8>("age")
+            .unwrap()
             .finish::<InsertInvalidUsizeIndex>();
         table.insert(InsertInvalidUsizeIndex);
     }
@@ -716,8 +807,10 @@ mod test {
     #[test]
     fn insert_wrong_type_returns_invalid_downcast() {
         let mut table = TableBuilder::default()
-            .add::<i32>("id").unwrap()
-            .add::<u8>("age").unwrap()
+            .add::<i32>("id")
+            .unwrap()
+            .add::<u8>("age")
+            .unwrap()
             .finish::<InsertWrongType>();
         table.insert(InsertWrongType);
     }
@@ -731,11 +824,18 @@ mod test {
     }
 
     impl SliceTableRow for BulkInvalidStringIndex {
-        fn visit_columns_slice<V: SliceFieldVisitor>(&self, visitor: &mut V) {
+        fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(
+            &'a self,
+            visitor: &mut V,
+        ) -> Result<(), VisitorError> {
             assert!(matches!(
-                visitor.visit_slice::<1, &str, i32>("nonexistent", &[42]),
-                Err(VisitorError::IndexNotFound(_))
+                visitor
+                    .visit_slice::<1, &str, i32>("nonexistent", &[42])
+                    .unwrap_err(),
+                VisitorError::IndexNotFound(_)
             ));
+
+            Ok(())
         }
     }
 
@@ -746,11 +846,18 @@ mod test {
     }
 
     impl SliceTableRow for BulkInvalidUsizeIndex {
-        fn visit_columns_slice<V: SliceFieldVisitor>(&self, visitor: &mut V) {
+        fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(
+            &'a self,
+            visitor: &mut V,
+        ) -> Result<(), VisitorError> {
             assert!(matches!(
-                visitor.visit_slice::<1, usize, i32>(999, &[42]),
-                Err(VisitorError::IndexNotFound(_))
+                visitor
+                    .visit_slice::<1, usize, i32>(999, &[42])
+                    .unwrap_err(),
+                VisitorError::IndexNotFound(_)
             ));
+
+            Ok(())
         }
     }
 
@@ -761,38 +868,49 @@ mod test {
     }
 
     impl SliceTableRow for BulkWrongType {
-        fn visit_columns_slice<V: SliceFieldVisitor>(&self, visitor: &mut V) {
+        fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(
+            &'a self,
+            visitor: &mut V,
+        ) -> Result<(), VisitorError> {
             assert!(matches!(
                 visitor.visit_slice::<1, &str, i64>("id", &[42i64]),
                 Err(VisitorError::InvalidDowncast(_))
             ));
+
+            Ok(())
         }
     }
 
     #[test]
     fn bulk_insert_unknown_string_index_returns_index_not_found() {
         let mut table = TableBuilder::default()
-            .add::<i32>("id").unwrap()
-            .add::<u8>("age").unwrap()
+            .add::<i32>("id")
+            .unwrap()
+            .add::<u8>("age")
+            .unwrap()
             .finish::<BulkInvalidStringIndex>();
-        table.bulk_insert(&BulkInvalidStringIndex);
+        table.bulk_insert(&BulkInvalidStringIndex).unwrap();
     }
 
     #[test]
     fn bulk_insert_out_of_bounds_usize_index_returns_index_not_found() {
         let mut table = TableBuilder::default()
-            .add::<i32>("id").unwrap()
-            .add::<u8>("age").unwrap()
+            .add::<i32>("id")
+            .unwrap()
+            .add::<u8>("age")
+            .unwrap()
             .finish::<BulkInvalidUsizeIndex>();
-        table.bulk_insert(&BulkInvalidUsizeIndex);
+        table.bulk_insert(&BulkInvalidUsizeIndex).unwrap();
     }
 
     #[test]
     fn bulk_insert_wrong_type_returns_invalid_downcast() {
         let mut table = TableBuilder::default()
-            .add::<i32>("id").unwrap()
-            .add::<u8>("age").unwrap()
+            .add::<i32>("id")
+            .unwrap()
+            .add::<u8>("age")
+            .unwrap()
             .finish::<BulkWrongType>();
-        table.bulk_insert(&BulkWrongType);
+        table.bulk_insert(&BulkWrongType).unwrap();
     }
 }

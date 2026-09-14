@@ -6,6 +6,7 @@ use plinth::storage_engine::table::{
     TableBuilder, TableRow, VisitorError,
 };
 use std::hint::black_box;
+use std::marker::PhantomData;
 use std::mem::size_of;
 use std::time::Duration;
 
@@ -65,21 +66,20 @@ where
     type Schema = BenchSchema;
 }
 
-impl<I, J> StreamingTableRow for StreamBatch<I, J>
-where
-    I: ExactSizeIterator<Item = i32>,
-    J: ExactSizeIterator<Item = i64>,
+impl<I: ExactSizeIterator<Item = i32>, J: ExactSizeIterator<Item = i64>> StreamingTableRow
+    for StreamBatch<I, J>
 {
-    fn visit_columns_streaming<V: StreamingFieldVisitor>(
+    fn visit_columns_streaming<'a, V: StreamingFieldVisitor<'a>>(
         self,
         visitor: &mut V,
-    ) -> Result<(), VisitorError> {
-        visitor.visit_fields::<&str, i32>("id", self.ids)?;
-        visitor.visit_fields::<&str, i64>("value", self.values)?;
-        Ok(())
+    ) -> Result<(), VisitorError>
+    where
+        Self: 'a,
+    {
+        visitor.visit_fields::<usize, i32>(0, self.ids)?;
+        visitor.visit_fields::<usize, i64>(1, self.values)
     }
 }
-
 // -----------------------------------------------------------------------------
 // Bulk: two columns
 // -----------------------------------------------------------------------------
@@ -94,9 +94,14 @@ impl<const N: usize> TableRow for SliceBatch<N> {
 }
 
 impl<const N: usize> SliceTableRow for SliceBatch<N> {
-    fn visit_columns_slice<V: SliceFieldVisitor>(&self, visitor: &mut V) {
+    fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(
+        &'a self,
+        visitor: &mut V,
+    ) -> Result<(), VisitorError> {
         let _ = visitor.visit_slice::<N, usize, i32>(0, &self.ids);
         let _ = visitor.visit_slice::<N, usize, i64>(1, &self.values);
+
+        Ok(())
     }
 }
 
@@ -115,15 +120,15 @@ where
     type Schema = BenchSchemaSingle;
 }
 
-impl<I> StreamingTableRow for StreamBatchSingle<I>
-where
-    I: ExactSizeIterator<Item = i32>,
-{
-    fn visit_columns_streaming<V: StreamingFieldVisitor>(
+impl<I: ExactSizeIterator<Item = i32>> StreamingTableRow for StreamBatchSingle<I> {
+    fn visit_columns_streaming<'a, V: StreamingFieldVisitor<'a>>(
         self,
         visitor: &mut V,
-    ) -> Result<(), VisitorError> {
-        visitor.visit_fields::<usize, i32>(0, self.values)?;
+    ) -> Result<(), VisitorError>
+    where
+        Self: 'a,
+    {
+        visitor.visit_fields::<usize, i32>(0, self.values);
         Ok(())
     }
 }
@@ -141,8 +146,11 @@ impl<const N: usize> TableRow for SliceBatchSingle<N> {
 }
 
 impl<const N: usize> SliceTableRow for SliceBatchSingle<N> {
-    fn visit_columns_slice<V: SliceFieldVisitor>(&self, visitor: &mut V) {
-        let _ = visitor.visit_slice::<N, usize, i32>(0, &self.values);
+    fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(
+        &'a self,
+        visitor: &mut V,
+    ) -> Result<(), VisitorError> {
+        visitor.visit_slice::<N, usize, i32>(0, &self.values)
     }
 }
 
