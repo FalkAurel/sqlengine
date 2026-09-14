@@ -1,4 +1,5 @@
-use std::{collections::HashMap, marker::PhantomData};
+use core::panic;
+use std::{collections::HashMap, marker::PhantomData, println, time::Instant};
 
 use crate::{
     storage_engine::{
@@ -144,7 +145,7 @@ impl<'a, T: TableRow> FieldVisitor for SingleFieldVisitor<'a, T> {
 pub(crate) struct StreamingVisitor<'a, T: TableRow> {
     table: &'a mut Table<T>,
     expected_len: Option<LogicalSize>,
-    iterators: Vec<PendingWrite<'a>>,
+    iterators: SmallVec<[PendingWrite<'a>; 10]>,
 }
 
 impl<'a, T: TableRow> StreamingVisitor<'a, T> {
@@ -191,7 +192,7 @@ impl<'a, T: TableRow> StreamingFieldVisitor<'a> for StreamingVisitor<'a, T> {
 
 pub(crate) struct SliceVisitor<'a, T: TableRow> {
     table: &'a mut Table<T>,
-    iterators: Vec<PendingWrite<'a>>,
+    iterators: SmallVec<[PendingWrite<'a>; 10]>,
 }
 
 impl<'a, T: TableRow> SliceVisitor<'a, T> {
@@ -457,6 +458,7 @@ pub mod schema {
 }
 
 pub use schema::{Empty, Node};
+use smallvec::SmallVec;
 
 #[derive(Debug)]
 pub struct DuplicateField;
@@ -469,7 +471,7 @@ pub struct DuplicateField;
 /// target row type — a mismatch or wrong column order is a type error, not a
 /// runtime panic.
 pub struct TableBuilder<Schema> {
-    columns: Vec<Column>,
+    columns: SmallVec<[Column; 10]>,
     column_resolver: HashMap<&'static str, LogicalOffset>,
     _schema: PhantomData<Schema>,
 }
@@ -477,7 +479,7 @@ pub struct TableBuilder<Schema> {
 impl Default for TableBuilder<Empty> {
     fn default() -> Self {
         Self {
-            columns: Vec::new(),
+            columns: SmallVec::new(),
             column_resolver: HashMap::new(),
             _schema: PhantomData,
         }
@@ -535,7 +537,7 @@ impl<T: TableRow> Table<T> {
     ) -> Result<(), VisitorError> {
         let mut visitor: StreamingVisitor<'_, T> = StreamingVisitor {
             table: self,
-            iterators: Vec::new(),
+            iterators: SmallVec::new(),
             expected_len: None,
         };
         source.visit_columns_streaming(&mut visitor)?;
@@ -549,7 +551,7 @@ impl<T: TableRow> Table<T> {
     ) -> Result<(), VisitorError> {
         let mut visitor: SliceVisitor<T> = SliceVisitor {
             table: self,
-            iterators: Vec::new(),
+            iterators: SmallVec::new(),
         };
         source.visit_columns_slice(&mut visitor)?;
         visitor.commit();

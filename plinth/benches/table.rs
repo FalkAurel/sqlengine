@@ -6,7 +6,6 @@ use plinth::storage_engine::table::{
     TableBuilder, TableRow, VisitorError,
 };
 use std::hint::black_box;
-use std::marker::PhantomData;
 use std::mem::size_of;
 use std::time::Duration;
 

@@ -1,8 +1,6 @@
 use std::ops::Range;
 
-use plinth::table::{
-    Empty, Node, StreamingTableRow, Table, TableBuilder, TableRow,
-};
+use plinth::table::{Empty, Node, StreamingTableRow, Table, TableBuilder, TableRow};
 
 fn main() {
     let mut user_stream: Table<UserStream> = TableBuilder::default()
