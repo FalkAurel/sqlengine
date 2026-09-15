@@ -204,12 +204,16 @@ macro_rules! bench_bulk_sizes {
             $group.throughput(Throughput::Bytes(
                 (N * (size_of::<i32>() + size_of::<i64>())) as u64,
             ));
+
             $group.bench_function(BenchmarkId::from_parameter(N), |b| {
-                b.iter(|| {
-                    let mut table = make_table();
-                    table.bulk_insert(black_box(&batch));
-                    black_box(table);
-                });
+                b.iter_batched(
+                    || make_table(),
+                    |mut table| {
+                        table.bulk_insert(black_box(&batch));
+                        black_box(table);
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
             });
         }
     )+};
