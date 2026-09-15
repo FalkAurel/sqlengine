@@ -198,22 +198,31 @@ macro_rules! bench_bulk_sizes {
     ($group:expr, [$($n:literal),+]) => {$(
         {
             const N: usize = $n;
-            let ids: Box<[i32; N]> = (0..N as i32).collect::<Vec<_>>().into_boxed_slice().try_into().unwrap();
-            let values: Box<[i64; N]> = (0..N as i64).collect::<Vec<_>>().into_boxed_slice().try_into().unwrap();
+
+            let ids: Box<[i32; N]> = (0..N as i32)
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+                .try_into()
+                .unwrap();
+
+            let values: Box<[i64; N]> = (0..N as i64)
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+                .try_into()
+                .unwrap();
+
             let batch = SliceBatch::<N> { ids, values };
+
             $group.throughput(Throughput::Bytes(
                 (N * (size_of::<i32>() + size_of::<i64>())) as u64,
             ));
 
             $group.bench_function(BenchmarkId::from_parameter(N), |b| {
-                b.iter_batched(
-                    || make_table(),
-                    |mut table| {
-                        table.bulk_insert(black_box(&batch));
-                        black_box(table);
-                    },
-                    criterion::BatchSize::LargeInput,
-                );
+                b.iter(|| {
+                    let mut table = make_table();
+                    table.bulk_insert(black_box(&batch));
+                    black_box(table);
+                });
             });
         }
     )+};
