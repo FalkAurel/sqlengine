@@ -544,6 +544,7 @@ impl<T: TableRow> Table<T> {
         Ok(())
     }
 
+    #[inline(never)]
     pub fn bulk_insert<S: SliceTableRow<Schema = T::Schema>>(
         &mut self,
         source: &S,
