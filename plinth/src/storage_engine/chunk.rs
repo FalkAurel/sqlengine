@@ -345,15 +345,17 @@ mod primitive_impls {
             $(
                 impl AppendableType for $native {
                     type Builder = $builder;
-                    fn builder() -> Self::Builder { <$builder>::with_capacity(CHUNK_SIZE.as_usize() * 20) }
+                    fn builder() -> Self::Builder { <$builder>::with_capacity(CHUNK_SIZE.as_usize()) }
                 }
                 impl AppendableType for Option<$native> {
                     type Builder = $builder;
-                    fn builder() -> Self::Builder { <$builder>::with_capacity(CHUNK_SIZE.as_usize() * 20) }
+                    fn builder() -> Self::Builder { <$builder>::with_capacity(CHUNK_SIZE.as_usize()) }
                 }
                 impl Append<$native> for $builder {
                     type Element = $native;
+                    #[inline(always)]
                     fn append(&mut self, value: $native) { self.append_value(value); }
+                    #[inline(always)]
                     fn append_values(&mut self, values: &[$native]) { self.append_slice(values); }
                 }
                 impl Append<Option<$native>> for $builder {

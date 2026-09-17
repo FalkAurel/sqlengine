@@ -1,203 +1,39 @@
-use criterion::{
-    BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use plinth::{
+    table::{Empty, Node, SliceTableRow, Table, TableBuilder, TableRow},
+    units::LogicalSize,
 };
-use plinth::storage_engine::table::{
-    Empty, Node, SliceFieldVisitor, SliceTableRow, StreamingFieldVisitor, StreamingTableRow, Table,
-    TableBuilder, TableRow, VisitorError,
-};
-use std::hint::black_box;
 use std::mem::size_of;
-use std::time::Duration;
 
-// -----------------------------------------------------------------------------
-// Schemas
-// -----------------------------------------------------------------------------
-
-type BenchSchema = Node<i64, Node<i32, Empty>>;
-type BenchSchemaSingle = Node<i32, Empty>;
-
-struct BenchRow;
-
-impl TableRow for BenchRow {
-    type Schema = BenchSchema;
-}
-
-struct BenchRowSingle;
-
-impl TableRow for BenchRowSingle {
-    type Schema = BenchSchemaSingle;
-}
-
-// -----------------------------------------------------------------------------
-// Tables
-// -----------------------------------------------------------------------------
-
-fn make_table() -> Table<BenchRow> {
-    TableBuilder::default()
-        .add::<i32>("id")
-        .unwrap()
-        .add::<i64>("value")
-        .unwrap()
-        .finish::<BenchRow>()
-}
-
-fn make_single_column_table() -> Table<BenchRowSingle> {
-    TableBuilder::default()
-        .add::<i32>("value")
-        .unwrap()
-        .finish::<BenchRowSingle>()
-}
-
-// -----------------------------------------------------------------------------
-// Streaming: two columns
-// -----------------------------------------------------------------------------
-
-struct StreamBatch<I, J> {
-    ids: I,
-    values: J,
-}
-
-impl<I, J> TableRow for StreamBatch<I, J>
-where
-    I: ExactSizeIterator<Item = i32>,
-    J: ExactSizeIterator<Item = i64>,
-{
-    type Schema = BenchSchema;
-}
-
-impl<I: ExactSizeIterator<Item = i32>, J: ExactSizeIterator<Item = i64>> StreamingTableRow
-    for StreamBatch<I, J>
-{
-    fn visit_columns_streaming<'a, V: StreamingFieldVisitor<'a>>(
-        self,
-        visitor: &mut V,
-    ) -> Result<(), VisitorError>
-    where
-        Self: 'a,
-    {
-        visitor.visit_fields::<usize, i32>(0, self.ids)?;
-        visitor.visit_fields::<usize, i64>(1, self.values)
-    }
-}
-// -----------------------------------------------------------------------------
-// Bulk: two columns
-// -----------------------------------------------------------------------------
-
-struct SliceBatch<const N: usize> {
+struct UserSlices<const N: usize> {
     ids: Box<[i32; N]>,
     values: Box<[i64; N]>,
 }
 
-impl<const N: usize> TableRow for SliceBatch<N> {
-    type Schema = BenchSchema;
+impl<const N: usize> TableRow for UserSlices<N> {
+    type Schema = Node<i64, Node<i32, Empty>>;
 }
 
-impl<const N: usize> SliceTableRow for SliceBatch<N> {
-    fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(
+impl<const N: usize> SliceTableRow for UserSlices<N> {
+    fn visit_columns_slice<'a, V: plinth::table::SliceFieldVisitor<'a>>(
         &'a self,
         visitor: &mut V,
-    ) -> Result<(), VisitorError> {
-        let _ = visitor.visit_slice::<N, usize, i32>(0, &self.ids);
-        let _ = visitor.visit_slice::<N, usize, i64>(1, &self.values);
-
-        Ok(())
+    ) -> Result<(), plinth::table::VisitorError> {
+        visitor.visit_slice::<N, usize, i32>(0, &self.ids)?;
+        visitor.visit_slice::<N, usize, i64>(1, &self.values)
     }
 }
 
-// -----------------------------------------------------------------------------
-// Streaming: single column
-// -----------------------------------------------------------------------------
+fn benchmark_mass_api_insertion(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bulk_insert");
 
-struct StreamBatchSingle<I> {
-    values: I,
-}
-
-impl<I> TableRow for StreamBatchSingle<I>
-where
-    I: ExactSizeIterator<Item = i32>,
-{
-    type Schema = BenchSchemaSingle;
-}
-
-impl<I: ExactSizeIterator<Item = i32>> StreamingTableRow for StreamBatchSingle<I> {
-    fn visit_columns_streaming<'a, V: StreamingFieldVisitor<'a>>(
-        self,
-        visitor: &mut V,
-    ) -> Result<(), VisitorError>
-    where
-        Self: 'a,
-    {
-        visitor.visit_fields::<usize, i32>(0, self.values);
-        Ok(())
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Bulk: single column
-// -----------------------------------------------------------------------------
-
-struct SliceBatchSingle<const N: usize> {
-    values: Box<[i32; N]>,
-}
-
-impl<const N: usize> TableRow for SliceBatchSingle<N> {
-    type Schema = BenchSchemaSingle;
-}
-
-impl<const N: usize> SliceTableRow for SliceBatchSingle<N> {
-    fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(
-        &'a self,
-        visitor: &mut V,
-    ) -> Result<(), VisitorError> {
-        visitor.visit_slice::<N, usize, i32>(0, &self.values)
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Bench sizes
-// -----------------------------------------------------------------------------
-
-const SIZES: [usize; 5] = [1_024, 16_384, 65_536, 131_072, 1_048_576];
-
-// -----------------------------------------------------------------------------
-// Bench: streaming, two columns
-// -----------------------------------------------------------------------------
-
-pub fn bench_table_write(c: &mut Criterion) {
-    let mut group = c.benchmark_group("table_write");
-    group.measurement_time(Duration::from_secs_f64(8.7));
-    group.sampling_mode(SamplingMode::Flat);
-    group.sample_size(50);
-
-    for &size in &SIZES {
-        group.throughput(Throughput::Bytes(
-            (size * (size_of::<i32>() + size_of::<i64>())) as u64,
-        ));
-
-        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
-            b.iter(|| {
-                let mut table = make_table();
-                let batch = StreamBatch {
-                    ids: (0..size as i32).map(|v| black_box(v)),
-                    values: (0..size as i32).map(|v| black_box(v as i64)),
-                };
-                table.streaming_insert(batch).unwrap();
-                black_box(table);
-            });
-        });
-    }
-
-    group.finish();
-}
-
-// -----------------------------------------------------------------------------
-// Bench: bulk, two columns
-// -----------------------------------------------------------------------------
-
-macro_rules! bench_bulk_sizes {
-    ($group:expr, [$($n:literal),+]) => {$(
-        {
+    macro_rules! bench {
+        ($n:expr) => {{
             const N: usize = $n;
+
+            let bytes = (N * (size_of::<i32>() + size_of::<i64>())) as u64;
+
+            group.throughput(Throughput::Bytes(bytes));
 
             let ids: Box<[i32; N]> = (0..N as i32)
                 .collect::<Vec<_>>()
@@ -211,103 +47,95 @@ macro_rules! bench_bulk_sizes {
                 .try_into()
                 .unwrap();
 
-            let batch = SliceBatch::<N> { ids, values };
+            let input = UserSlices::<N> { ids, values };
 
-            $group.throughput(Throughput::Bytes(
-                (N * (size_of::<i32>() + size_of::<i64>())) as u64,
-            ));
-
-            $group.bench_function(BenchmarkId::from_parameter(N), |b| {
-                b.iter(|| {
-                    let mut table = make_table();
-                    table.bulk_insert(black_box(&batch));
-                    black_box(table);
-                });
+            group.bench_function(BenchmarkId::from_parameter(N), |b| {
+                b.iter_batched_ref(
+                    || {
+                        TableBuilder::default()
+                            .add::<i32>("ids")
+                            .unwrap()
+                            .add::<i64>("values")
+                            .unwrap()
+                            .finish::<UserSlices<N>>()
+                    },
+                    |table| {
+                        std::hint::black_box(table.bulk_insert(&input).unwrap());
+                    },
+                    criterion::BatchSize::PerIteration,
+                );
             });
-        }
-    )+};
-}
-
-pub fn bench_table_write_values(c: &mut Criterion) {
-    let mut group = c.benchmark_group("table_write_values");
-    group.measurement_time(Duration::from_secs_f64(8.7));
-    group.sampling_mode(SamplingMode::Flat);
-    group.sample_size(50);
-    bench_bulk_sizes!(group, [1_024, 16_384, 65_536, 131_072, 1_048_576]);
-    group.finish();
-}
-
-// -----------------------------------------------------------------------------
-// Bench: streaming, single column
-// -----------------------------------------------------------------------------
-
-pub fn bench_single_column_table_write(c: &mut Criterion) {
-    let mut group = c.benchmark_group("single_column_table_write");
-    group.measurement_time(Duration::from_secs_f64(8.7));
-    group.sampling_mode(SamplingMode::Flat);
-    group.sample_size(50);
-
-    for &size in &SIZES {
-        group.throughput(Throughput::Bytes((size * size_of::<i32>()) as u64));
-
-        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
-            b.iter(|| {
-                let mut table = make_single_column_table();
-                let batch = StreamBatchSingle {
-                    values: (0..size as i32).map(|v| black_box(v)),
-                };
-                table.streaming_insert(batch).unwrap();
-                black_box(table);
-            });
-        });
+        }};
     }
 
+    bench!(1024);
+    bench!(16_384);
+    bench!(65_536);
+    bench!(131_072);
+    bench!(1_048_576);
+
     group.finish();
 }
 
-// -----------------------------------------------------------------------------
-// Bench: bulk, single column
-// -----------------------------------------------------------------------------
+fn benchmark_arrow_append(c: &mut Criterion) {
+    let mut group = c.benchmark_group("arrow_append");
 
-macro_rules! bench_single_bulk_sizes {
-    ($group:expr, [$($n:literal),+]) => {$(
-        {
+    macro_rules! bench {
+        ($n:expr) => {{
             const N: usize = $n;
-            let values: Box<[i32; N]> = (0..N as i32).collect::<Vec<_>>().into_boxed_slice().try_into().unwrap();
-            let batch = SliceBatchSingle::<N> { values };
-            $group.throughput(Throughput::Bytes(
-                (N * size_of::<i32>()) as u64,
-            ));
-            $group.bench_function(BenchmarkId::from_parameter(N), |b| {
+            const CHUNK_SIZE: usize = 64 * 1024;
+
+            let bytes = (N * (size_of::<i32>() + size_of::<i64>())) as u64;
+            group.throughput(Throughput::Bytes(bytes));
+
+            let ids: Box<[i32; N]> = (0..N as i32)
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+                .try_into()
+                .unwrap();
+
+            let values: Box<[i64; N]> = (0..N as i64)
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+                .try_into()
+                .unwrap();
+
+            group.bench_function(BenchmarkId::from_parameter(N), |b| {
                 b.iter(|| {
-                    let mut table = make_single_column_table();
-                    table.bulk_insert(black_box(&batch));
-                    black_box(table);
+                    let mut i32_builder = arrow::array::Int32Builder::with_capacity(N);
+                    let mut i64_builder = arrow::array::Int64Builder::with_capacity(N);
+
+                    for start in (0..N).step_by(CHUNK_SIZE) {
+                        let end = (start + CHUNK_SIZE).min(N);
+
+                        std::hint::black_box(
+                            i32_builder.append_slice(std::hint::black_box(&ids[start..end])),
+                        );
+
+                        std::hint::black_box(
+                            i64_builder.append_slice(std::hint::black_box(&values[start..end])),
+                        );
+                    }
+
+                    std::hint::black_box(i32_builder.finish());
+                    std::hint::black_box(i64_builder.finish());
                 });
             });
-        }
-    )+};
-}
+        }};
+    }
 
-pub fn bench_single_column_table_write_values(c: &mut Criterion) {
-    let mut group = c.benchmark_group("single_column_table_write_values");
-    group.measurement_time(Duration::from_secs_f64(8.7));
-    group.sampling_mode(SamplingMode::Flat);
-    group.sample_size(50);
-    bench_single_bulk_sizes!(group, [1_024, 16_384, 65_536, 131_072, 1_048_576]);
+    bench!(1024);
+    bench!(16_384);
+    bench!(65_536);
+    bench!(131_072);
+    bench!(1_048_576);
+
     group.finish();
 }
-
-// -----------------------------------------------------------------------------
-// Criterion
-// -----------------------------------------------------------------------------
 
 criterion_group!(
     benches,
-    bench_table_write,
-    bench_table_write_values,
-    bench_single_column_table_write,
-    bench_single_column_table_write_values,
+    benchmark_mass_api_insertion,
+    benchmark_arrow_append
 );
-
 criterion_main!(benches);

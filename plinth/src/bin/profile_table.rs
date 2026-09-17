@@ -1,15 +1,20 @@
-use std::ops::Range;
+use std::{
+    ops::Range,
+    time::{Duration, Instant},
+};
 
+use arrow::array::{Int32Builder, Int64Builder};
 use plinth::table::{
     Empty, Node, SliceFieldVisitor, SliceTableRow, StreamingTableRow, Table, TableBuilder,
     TableRow, VisitorError,
 };
 
-fn main() {
-    #[cfg(feature = "streaming")]
-    streaming_append();
+const N: usize = 1024 * 1024;
+const CHUNK_SIZE: usize = 64 * 1024;
 
+fn main() {
     slice_append();
+    arrow_append();
 }
 
 struct UserStream {
@@ -42,62 +47,102 @@ impl<const N: usize> TableRow for SliceBatch<N> {
 }
 
 impl<const N: usize> SliceTableRow for SliceBatch<N> {
+    #[inline(always)]
     fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(
         &'a self,
         visitor: &mut V,
     ) -> Result<(), VisitorError> {
-        let _ = visitor.visit_slice::<N, usize, i32>(0, &self.ids);
-        let _ = visitor.visit_slice::<N, usize, i64>(1, &self.values);
+        visitor.visit_slice::<N, usize, i32>(0, &self.ids)?;
+        visitor.visit_slice::<N, usize, i64>(1, &self.values)?;
 
         Ok(())
     }
 }
 
-fn slice_append() {
-    const N: usize = 1024 * 1024;
+fn make_batch() -> SliceBatch<N> {
     let ids: Box<[i32; N]> = (0..N as i32)
         .collect::<Vec<_>>()
         .into_boxed_slice()
         .try_into()
         .unwrap();
+
     let values: Box<[i64; N]> = (0..N as i64)
         .collect::<Vec<_>>()
         .into_boxed_slice()
         .try_into()
         .unwrap();
-    let batch: SliceBatch<1048576> = SliceBatch::<N> { ids, values };
 
-    // let mut table: Table<SliceBatch<N>> = TableBuilder::default()
-    //     .add("ids")
-    //     .unwrap()
-    //     .add("values")
-    //     .unwrap()
-    //     .finish();
+    SliceBatch { ids, values }
+}
+
+fn slice_append() {
+    let batch = make_batch();
+
+    let mut table_total = Duration::ZERO;
 
     for _ in 0..10_000 {
         let mut table: Table<SliceBatch<N>> = TableBuilder::default()
-        .add("ids")
-        .unwrap()
-        .add("values")
-        .unwrap()
-        .finish();
+            .add::<i32>("ids")
+            .unwrap()
+            .add::<i64>("values")
+            .unwrap()
+            .finish();
+
+        let start = Instant::now();
 
         std::hint::black_box(table.bulk_insert(&batch).unwrap());
+
+        table_total += start.elapsed();
+
+        std::hint::black_box(table);
     }
+
+    println!("Table bulk_insert: {:?} per 1M rows", table_total / 10_000);
+}
+
+fn arrow_append() {
+    let mut arrow_total = Duration::ZERO;
+    let batch = make_batch();
+
+    for _ in 0..10_000 {
+        let mut i32_builder = Int32Builder::with_capacity(CHUNK_SIZE);
+        let mut i64_builder = Int64Builder::with_capacity(CHUNK_SIZE);
+
+        let start = Instant::now();
+
+        for start_idx in (0..N).step_by(CHUNK_SIZE) {
+            let end = (start_idx + CHUNK_SIZE).min(N);
+
+            std::hint::black_box(
+                i32_builder.append_slice(std::hint::black_box(&batch.ids[start_idx..end])),
+            );
+
+            std::hint::black_box(
+                i64_builder.append_slice(std::hint::black_box(&batch.values[start_idx..end])),
+            );
+
+            std::hint::black_box(i32_builder.finish());
+            std::hint::black_box(i64_builder.finish());
+        }
+
+        arrow_total += start.elapsed();
+    }
+
+    println!("Raw Arrow append: {:?} per 1M rows", arrow_total / 10_000);
 }
 
 #[cfg(feature = "streaming")]
 fn streaming_append() {
-    let mut user_stream: Table<UserStream> = TableBuilder::default()
+    let mut table: Table<UserStream> = TableBuilder::default()
         .add::<i32>("values")
         .unwrap()
         .finish();
 
-    for _ in 0..10000 {
+    for _ in 0..10_000 {
         std::hint::black_box(
-            user_stream
+            table
                 .streaming_insert(UserStream {
-                    values: 0..(1024 * 1024),
+                    values: 0..N as i32,
                 })
                 .unwrap(),
         );

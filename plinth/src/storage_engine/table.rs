@@ -29,6 +29,7 @@ mod sealed {
 
     impl Index for &'static str {
         #[allow(private_interfaces)]
+        #[inline(always)]
         fn resolve<T: TableRow>(&self, table: &Table<T>) -> Result<LogicalOffset, IndexNotFound> {
             table
                 .column_resolver
@@ -40,6 +41,7 @@ mod sealed {
 
     impl Index for usize {
         #[allow(private_interfaces)]
+        #[inline(always)]
         fn resolve<T: TableRow>(&self, table: &Table<T>) -> Result<LogicalOffset, IndexNotFound> {
             if *self < table.columns.len() {
                 Ok(LogicalOffset::new(*self as u64))
@@ -204,6 +206,7 @@ impl<'a, T: TableRow> SliceVisitor<'a, T> {
 }
 
 impl<'a, T: TableRow> SliceFieldVisitor<'a> for SliceVisitor<'a, T> {
+    #[inline(always)]
     fn visit_slice<'slice: 'a, const N: usize, I: Index, V: AppendableType>(
         &mut self,
         index: I,
