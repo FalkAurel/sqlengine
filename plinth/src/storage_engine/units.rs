@@ -18,9 +18,9 @@ impl LogicalSize {
     }
 }
 
-impl Into<usize> for LogicalSize {
-    fn into(self) -> usize {
-        self.0 as usize
+impl From<LogicalSize> for usize {
+    fn from(val: LogicalSize) -> Self {
+        val.0 as usize
     }
 }
 

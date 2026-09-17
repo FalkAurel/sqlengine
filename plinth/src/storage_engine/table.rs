@@ -54,6 +54,7 @@ mod sealed {
 
 struct PendingWrite<'a> {
     index: LogicalOffset,
+    #[allow(clippy::type_complexity)]
     callback: Box<dyn FnOnce(&mut Column) -> Result<(), InvalidDowncast> + 'a>,
 }
 
@@ -289,8 +290,8 @@ pub trait TableRow {
 /// }
 ///
 /// let mut table = TableBuilder::default()
-///     .add::<i32>("id").unwrap()
-///     .add::<u8>("age").unwrap()
+///     .with_column::<i32>("id").unwrap()
+///     .with_column::<u8>("age").unwrap()
 ///     .finish::<UserRow>();
 ///
 /// table.insert(UserRow { id: 1, age: 30 });
@@ -349,8 +350,8 @@ pub trait RowInsert: TableRow {
 /// }
 ///
 /// let mut table = TableBuilder::default()
-///     .add::<i32>("id").unwrap()
-///     .add::<u8>("age").unwrap()
+///     .with_column::<i32>("id").unwrap()
+///     .with_column::<u8>("age").unwrap()
 ///     .finish::<UserRow>();
 ///
 /// let stream = UserStream {
@@ -429,8 +430,8 @@ pub trait StreamingTableRow: TableRow {
 /// }
 ///
 /// let mut table = TableBuilder::default()
-///     .add::<i32>("id").unwrap()
-///     .add::<u8>("age").unwrap()
+///     .with_column::<i32>("id").unwrap()
+///     .with_column::<u8>("age").unwrap()
 ///     .finish::<UserRow>();
 ///
 /// let batch = UserBatch::<3>::try_new(
@@ -489,7 +490,7 @@ impl Default for TableBuilder<Empty> {
 }
 
 impl<Schema: SchemaList> TableBuilder<Schema> {
-    pub fn add<V: AppendableType>(
+    pub fn with_column<V: AppendableType>(
         mut self,
         id: &'static str,
     ) -> Result<TableBuilder<Node<V, Schema>>, DuplicateField> {
@@ -601,9 +602,9 @@ mod test {
 
     fn make_table() -> super::Table<UserRow> {
         TableBuilder::default()
-            .add::<i32>("id")
+            .with_column::<i32>("id")
             .unwrap()
-            .add::<u8>("age")
+            .with_column::<u8>("age")
             .unwrap()
             .finish::<UserRow>()
     }
@@ -790,9 +791,9 @@ mod test {
     #[test]
     fn insert_unknown_string_index_returns_index_not_found() {
         let mut table = TableBuilder::default()
-            .add::<i32>("id")
+            .with_column::<i32>("id")
             .unwrap()
-            .add::<u8>("age")
+            .with_column::<u8>("age")
             .unwrap()
             .finish::<InsertInvalidStringIndex>();
         table.insert(InsertInvalidStringIndex);
@@ -801,9 +802,9 @@ mod test {
     #[test]
     fn insert_out_of_bounds_usize_index_returns_index_not_found() {
         let mut table = TableBuilder::default()
-            .add::<i32>("id")
+            .with_column::<i32>("id")
             .unwrap()
-            .add::<u8>("age")
+            .with_column::<u8>("age")
             .unwrap()
             .finish::<InsertInvalidUsizeIndex>();
         table.insert(InsertInvalidUsizeIndex);
@@ -812,9 +813,9 @@ mod test {
     #[test]
     fn insert_wrong_type_returns_invalid_downcast() {
         let mut table = TableBuilder::default()
-            .add::<i32>("id")
+            .with_column::<i32>("id")
             .unwrap()
-            .add::<u8>("age")
+            .with_column::<u8>("age")
             .unwrap()
             .finish::<InsertWrongType>();
         table.insert(InsertWrongType);
@@ -889,9 +890,9 @@ mod test {
     #[test]
     fn bulk_insert_unknown_string_index_returns_index_not_found() {
         let mut table = TableBuilder::default()
-            .add::<i32>("id")
+            .with_column::<i32>("id")
             .unwrap()
-            .add::<u8>("age")
+            .with_column::<u8>("age")
             .unwrap()
             .finish::<BulkInvalidStringIndex>();
         table.bulk_insert(&BulkInvalidStringIndex).unwrap();
@@ -900,9 +901,9 @@ mod test {
     #[test]
     fn bulk_insert_out_of_bounds_usize_index_returns_index_not_found() {
         let mut table = TableBuilder::default()
-            .add::<i32>("id")
+            .with_column::<i32>("id")
             .unwrap()
-            .add::<u8>("age")
+            .with_column::<u8>("age")
             .unwrap()
             .finish::<BulkInvalidUsizeIndex>();
         table.bulk_insert(&BulkInvalidUsizeIndex).unwrap();
@@ -911,9 +912,9 @@ mod test {
     #[test]
     fn bulk_insert_wrong_type_returns_invalid_downcast() {
         let mut table = TableBuilder::default()
-            .add::<i32>("id")
+            .with_column::<i32>("id")
             .unwrap()
-            .add::<u8>("age")
+            .with_column::<u8>("age")
             .unwrap()
             .finish::<BulkWrongType>();
         table.bulk_insert(&BulkWrongType).unwrap();

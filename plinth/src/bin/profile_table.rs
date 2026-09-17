@@ -82,15 +82,15 @@ fn slice_append() {
 
     for _ in 0..10_000 {
         let mut table: Table<SliceBatch<N>> = TableBuilder::default()
-            .add::<i32>("ids")
+            .with_column::<i32>("ids")
             .unwrap()
-            .add::<i64>("values")
+            .with_column::<i64>("values")
             .unwrap()
             .finish();
 
         let start = Instant::now();
 
-        std::hint::black_box(table.bulk_insert(&batch).unwrap());
+        std::hint::black_box(table.bulk_insert(&batch)).unwrap();
 
         table_total += start.elapsed();
 
@@ -113,13 +113,9 @@ fn arrow_append() {
         for start_idx in (0..N).step_by(CHUNK_SIZE) {
             let end = (start_idx + CHUNK_SIZE).min(N);
 
-            std::hint::black_box(
-                i32_builder.append_slice(std::hint::black_box(&batch.ids[start_idx..end])),
-            );
+            i32_builder.append_slice(std::hint::black_box(&batch.ids[start_idx..end]));
 
-            std::hint::black_box(
-                i64_builder.append_slice(std::hint::black_box(&batch.values[start_idx..end])),
-            );
+            i64_builder.append_slice(std::hint::black_box(&batch.values[start_idx..end]));
 
             std::hint::black_box(i32_builder.finish());
             std::hint::black_box(i64_builder.finish());
@@ -131,20 +127,16 @@ fn arrow_append() {
     println!("Raw Arrow append: {:?} per 1M rows", arrow_total / 10_000);
 }
 
-#[cfg(feature = "streaming")]
 fn streaming_append() {
     let mut table: Table<UserStream> = TableBuilder::default()
-        .add::<i32>("values")
+        .with_column::<i32>("values")
         .unwrap()
         .finish();
 
     for _ in 0..10_000 {
-        std::hint::black_box(
-            table
-                .streaming_insert(UserStream {
-                    values: 0..N as i32,
-                })
-                .unwrap(),
-        );
+        std::hint::black_box(table.streaming_insert(UserStream {
+            values: 0..N as i32,
+        }))
+        .unwrap();
     }
 }
