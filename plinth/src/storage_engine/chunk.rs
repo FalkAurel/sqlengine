@@ -336,6 +336,8 @@ mod primitive_impls {
         Int64Builder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
     };
 
+    use crate::storage_engine::chunk::CHUNK_SIZE;
+
     use super::{Append, AppendableType};
 
     macro_rules! impl_primitive_appendable {
@@ -343,15 +345,17 @@ mod primitive_impls {
             $(
                 impl AppendableType for $native {
                     type Builder = $builder;
-                    fn builder() -> Self::Builder { <$builder>::new() }
+                    fn builder() -> Self::Builder { <$builder>::with_capacity(CHUNK_SIZE.as_usize()) }
                 }
                 impl AppendableType for Option<$native> {
                     type Builder = $builder;
-                    fn builder() -> Self::Builder { <$builder>::new() }
+                    fn builder() -> Self::Builder { <$builder>::with_capacity(CHUNK_SIZE.as_usize()) }
                 }
                 impl Append<$native> for $builder {
                     type Element = $native;
+                    #[inline(always)]
                     fn append(&mut self, value: $native) { self.append_value(value); }
+                    #[inline(always)]
                     fn append_values(&mut self, values: &[$native]) { self.append_slice(values); }
                 }
                 impl Append<Option<$native>> for $builder {

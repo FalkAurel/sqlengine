@@ -29,7 +29,7 @@ pub fn bench_column_write(c: &mut Criterion) {
         (CHUNK_SIZE + CHUNK_SIZE).get(),
         1_048_576,
     ] {
-        group.throughput(Throughput::Elements(size));
+        group.throughput(Throughput::Bytes(size * 4));
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             b.iter(|| {
@@ -57,7 +57,7 @@ pub fn bench_column_write_values(c: &mut Criterion) {
         (CHUNK_SIZE + CHUNK_SIZE).get(),
         1_048_576,
     ] {
-        group.throughput(Throughput::Elements(size));
+        group.throughput(Throughput::Bytes(size * 4));
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             let values: Vec<i32> = (0..size as i32).collect();
@@ -90,7 +90,7 @@ pub fn bench_raw_arrow(c: &mut Criterion) {
         (CHUNK_SIZE + CHUNK_SIZE).get(),
         1_048_576,
     ] {
-        group.throughput(Throughput::Elements(size));
+        group.throughput(Throughput::Bytes(size * 4));
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             b.iter(|| {
@@ -118,7 +118,7 @@ pub fn bench_raw_arrow_chunked_retained(c: &mut Criterion) {
         (CHUNK_SIZE + CHUNK_SIZE).get(),
         1_048_576,
     ] {
-        group.throughput(Throughput::Elements(size));
+        group.throughput(Throughput::Bytes(size * 4));
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             b.iter(|| {

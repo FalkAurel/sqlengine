@@ -2,7 +2,7 @@ use std::ops::Add;
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct LogicalSize(u64);
+pub struct LogicalSize(u64);
 
 impl LogicalSize {
     pub const fn new(size: u64) -> Self {
@@ -11,6 +11,16 @@ impl LogicalSize {
 
     pub const fn get(&self) -> u64 {
         self.0
+    }
+
+    pub const fn as_usize(&self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl From<LogicalSize> for usize {
+    fn from(val: LogicalSize) -> Self {
+        val.0 as usize
     }
 }
 
@@ -32,6 +42,10 @@ impl LogicalOffset {
 
     pub const fn get(&self) -> u64 {
         self.0
+    }
+
+    pub const fn as_usize(&self) -> usize {
+        self.0 as usize
     }
 }
 

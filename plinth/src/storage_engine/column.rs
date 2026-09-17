@@ -36,7 +36,6 @@ impl Column {
         }
     }
 
-    #[inline(always)]
     pub(crate) fn write<V: AppendableType + Send>(
         &mut self,
         values: impl Iterator<Item = <<V as AppendableType>::Builder as Append<V>>::Element>,
@@ -78,7 +77,6 @@ impl Column {
         Ok(())
     }
 
-    #[inline(always)]
     pub(crate) fn write_values<B: AppendableType + Send>(
         &mut self,
         mut values: &[<<B as AppendableType>::Builder as Append<B>>::Element],
