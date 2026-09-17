@@ -46,14 +46,14 @@ impl<const N: usize> TableRow for SliceBatch<N> {
     type Schema = Node<i64, Node<i32, Empty>>;
 }
 
-impl<const N: usize> SliceTableRow for SliceBatch<N> {
+impl<const N: usize> SliceTableRow<N> for SliceBatch<N> {
     #[inline(always)]
-    fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(
+    fn visit_columns_slice<'a, V: SliceFieldVisitor<'a, N>>(
         &'a self,
         visitor: &mut V,
     ) -> Result<(), VisitorError> {
-        visitor.visit_slice::<N, usize, i32>(0, &self.ids)?;
-        visitor.visit_slice::<N, usize, i64>(1, &self.values)?;
+        visitor.visit_slice::<usize, i32>(0, &self.ids)?;
+        visitor.visit_slice::<usize, i64>(1, &self.values)?;
 
         Ok(())
     }

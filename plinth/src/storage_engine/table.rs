@@ -114,8 +114,8 @@ pub trait StreamingFieldVisitor<'a> {
 /// This is the preferred path for transferring large amounts of data into the
 /// table. Use [`StreamingFieldVisitor`] when a contiguous slice is not
 /// available, or [`FieldVisitor`] for single-value writes.
-pub trait SliceFieldVisitor<'a> {
-    fn visit_slice<'slice: 'a, const N: usize, I: Index, V: AppendableType>(
+pub trait SliceFieldVisitor<'a, const N: usize> {
+    fn visit_slice<'slice: 'a, I: Index, V: AppendableType>(
         &mut self,
         index: I,
         values: &'slice [<<V as AppendableType>::Builder as Append<V>>::Element; N],
@@ -206,9 +206,9 @@ impl<'a, T: TableRow> SliceVisitor<'a, T> {
     }
 }
 
-impl<'a, T: TableRow> SliceFieldVisitor<'a> for SliceVisitor<'a, T> {
+impl<'a, const N: usize, T: TableRow> SliceFieldVisitor<'a, N> for SliceVisitor<'a, T> {
     #[inline(always)]
-    fn visit_slice<'slice: 'a, const N: usize, I: Index, V: AppendableType>(
+    fn visit_slice<'slice: 'a, I: Index, V: AppendableType>(
         &mut self,
         index: I,
         values: &'slice [<<V as AppendableType>::Builder as Append<V>>::Element; N],
@@ -416,14 +416,14 @@ pub trait StreamingTableRow: TableRow {
 ///     type Schema = Node<u8, Node<i32, Empty>>;
 /// }
 ///
-/// impl<const N: usize> SliceTableRow for UserBatch<N> {
-///     fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(&'a self, visitor: &mut V) -> Result<(), VisitorError> {
+/// impl<const N: usize> SliceTableRow<N> for UserBatch<N> {
+///     fn visit_columns_slice<'a, V: SliceFieldVisitor<'a, N>>(&'a self, visitor: &mut V) -> Result<(), VisitorError> {
 ///         // For primitive types, each call maps to append_slice — a memcpy
 ///         // over the Arrow buffer. One downcast per column, no per-value cost.
 ///         // Equal length is guaranteed by N — no runtime length check needed.
 ///         
-///         let _ = visitor.visit_slice::<N, &str, i32>("id", self.ids.as_ref());
-///         let _ = visitor.visit_slice::<N, &str, u8>("age", self.ages.as_ref());
+///         let _ = visitor.visit_slice::<&str, i32>("id", self.ids.as_ref());
+///         let _ = visitor.visit_slice::<&str, u8>("age", self.ages.as_ref());
 ///
 ///         Ok(())
 ///     }
@@ -441,8 +441,8 @@ pub trait StreamingTableRow: TableRow {
 ///
 /// table.bulk_insert(&batch);
 /// ```
-pub trait SliceTableRow: TableRow {
-    fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(
+pub trait SliceTableRow<const N: usize>: TableRow {
+    fn visit_columns_slice<'a, V: SliceFieldVisitor<'a, N>>(
         &'a self,
         visitor: &mut V,
     ) -> Result<(), VisitorError>;
@@ -549,7 +549,7 @@ impl<T: TableRow> Table<T> {
     }
 
     #[inline(never)]
-    pub fn bulk_insert<S: SliceTableRow<Schema = T::Schema>>(
+    pub fn bulk_insert<const NUM_ROWS: usize, S: SliceTableRow<NUM_ROWS, Schema = T::Schema>>(
         &mut self,
         source: &S,
     ) -> Result<(), VisitorError> {
@@ -557,7 +557,7 @@ impl<T: TableRow> Table<T> {
             table: self,
             iterators: SmallVec::new(),
         };
-        source.visit_columns_slice(&mut visitor)?;
+        source.visit_columns_slice::<SliceVisitor<T>>(&mut visitor)?;
         visitor.commit();
 
         Ok(())
@@ -829,14 +829,14 @@ mod test {
         type Schema = Node<u8, Node<i32, Empty>>;
     }
 
-    impl SliceTableRow for BulkInvalidStringIndex {
-        fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(
+    impl SliceTableRow<1> for BulkInvalidStringIndex {
+        fn visit_columns_slice<'a, V: SliceFieldVisitor<'a, 1>>(
             &'a self,
             visitor: &mut V,
         ) -> Result<(), VisitorError> {
             assert!(matches!(
                 visitor
-                    .visit_slice::<1, &str, i32>("nonexistent", &[42])
+                    .visit_slice::<&str, i32>("nonexistent", &[42])
                     .unwrap_err(),
                 VisitorError::IndexNotFound(_)
             ));
@@ -851,15 +851,13 @@ mod test {
         type Schema = Node<u8, Node<i32, Empty>>;
     }
 
-    impl SliceTableRow for BulkInvalidUsizeIndex {
-        fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(
+    impl SliceTableRow<1> for BulkInvalidUsizeIndex {
+        fn visit_columns_slice<'a, V: SliceFieldVisitor<'a, 1>>(
             &'a self,
             visitor: &mut V,
         ) -> Result<(), VisitorError> {
             assert!(matches!(
-                visitor
-                    .visit_slice::<1, usize, i32>(999, &[42])
-                    .unwrap_err(),
+                visitor.visit_slice::<usize, i32>(999, &[42]).unwrap_err(),
                 VisitorError::IndexNotFound(_)
             ));
 
@@ -873,13 +871,13 @@ mod test {
         type Schema = Node<u8, Node<i32, Empty>>;
     }
 
-    impl SliceTableRow for BulkWrongType {
-        fn visit_columns_slice<'a, V: SliceFieldVisitor<'a>>(
+    impl SliceTableRow<1> for BulkWrongType {
+        fn visit_columns_slice<'a, V: SliceFieldVisitor<'a, 1>>(
             &'a self,
             visitor: &mut V,
         ) -> Result<(), VisitorError> {
             assert!(matches!(
-                visitor.visit_slice::<1, &str, i64>("id", &[42i64]),
+                visitor.visit_slice::<&str, i64>("id", &[42i64]),
                 Err(VisitorError::InvalidDowncast(_))
             ));
 
