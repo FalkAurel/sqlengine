@@ -26,11 +26,11 @@ Exercises the complete write path: schema validation, chunk allocation, versioni
 
 | Rows | Time (median) | Throughput (median) |
 |------------:|------------------:|------------------------:|
-| 1,024 | 222.12 ns | 51.52 GiB/s |
-| 16,384 | 2.85 µs | 64.25 GiB/s |
-| 65,536 | 10.98 µs | 66.73 GiB/s |
-| 131,072 | 22.01 µs | 66.55 GiB/s |
-| 1,048,576 | 216.14 µs | 54.22 GiB/s |
+| 1,024 | 221.47 ns | 51.674 GiB/s |
+| 16,384 | 2.8477 µs | 64.300 GiB/s |
+| 65,536 | 10.972 µs | 66.757 GiB/s |
+| 131,072 | 22.227 µs | 65.904 GiB/s |
+| 1,048,576 | 197.26 µs | 59.406 GiB/s |
 
 #### `arrow_append` — Raw Arrow Builders (Baseline)
 
@@ -38,10 +38,10 @@ Measures only the underlying Arrow `append_slice` calls — no validation, no ve
 
 | Rows | Time (median) | Throughput (median) |
 |------------:|------------------:|------------------------:|
-| 1,024 | 756.55 ns | 15.13 GiB/s |
-| 16,384 | 2.96 µs | 61.92 GiB/s |
-| 65,536 | 11.06 µs | 66.21 GiB/s |
-| 131,072 | 22.13 µs | 66.19 GiB/s |
-| 1,048,576 | 266.66 µs | 43.95 GiB/s |
+| 1,024 | 296.17 ns | 38.640 GiB/s |
+| 16,384 | 2.9335 µs | 62.419 GiB/s |
+| 65,536 | 11.107 µs | 65.942 GiB/s |
+| 131,072 | 22.094 µs | 66.300 GiB/s |
+| 1,048,576 | 193.75 µs | 60.484 GiB/s |
 
-> At non-trivial row counts the Table's `bulk_insert` matches or **outperforms** raw Arrow appends, confirming that the abstraction adds no measurable overhead.
+> `bulk_insert` is zero-cost relative to raw Arrow — and outperforms it at N < 2¹⁶, where the mutable tail stays open and finalization is deferred.

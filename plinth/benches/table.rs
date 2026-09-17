@@ -1,4 +1,4 @@
-use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use plinth::table::{Empty, Node, SliceTableRow, TableBuilder, TableRow};
 use std::mem::size_of;
 
@@ -11,13 +11,13 @@ impl<const N: usize> TableRow for UserSlices<N> {
     type Schema = Node<i64, Node<i32, Empty>>;
 }
 
-impl<const N: usize> SliceTableRow for UserSlices<N> {
-    fn visit_columns_slice<'a, V: plinth::table::SliceFieldVisitor<'a>>(
+impl<const N: usize> SliceTableRow<N> for UserSlices<N> {
+    fn visit_columns_slice<'a, V: plinth::table::SliceFieldVisitor<'a, N>>(
         &'a self,
         visitor: &mut V,
     ) -> Result<(), plinth::table::VisitorError> {
-        visitor.visit_slice::<N, usize, i32>(0, &self.ids)?;
-        visitor.visit_slice::<N, usize, i64>(1, &self.values)
+        visitor.visit_slice::<usize, i32>(0, &self.ids)?;
+        visitor.visit_slice::<usize, i64>(1, &self.values)
     }
 }
 
@@ -112,30 +112,28 @@ fn benchmark_arrow_append(c: &mut Criterion) {
                 .unwrap();
 
             group.bench_function(BenchmarkId::from_parameter(N), |b| {
-                b.iter_batched(
-                    || {
-                        let i32_builder = arrow::array::Int32Builder::with_capacity(CHUNK_SIZE);
-                        let i64_builder = arrow::array::Int64Builder::with_capacity(CHUNK_SIZE);
-                        (i32_builder, i64_builder)
-                    },
-                    |(mut i32_builder, mut i64_builder)| {
-                        for start in (0..N).step_by(CHUNK_SIZE) {
-                            let end = (start + CHUNK_SIZE).min(N);
+                b.iter(|| {
+                    for start in (0..N).step_by(CHUNK_SIZE) {
+                        let end = (start + CHUNK_SIZE).min(N);
 
-                            std::hint::black_box(
-                                i32_builder.append_slice(std::hint::black_box(&ids[start..end])),
-                            );
+                        let mut i32_builder = arrow::array::Int32Builder::with_capacity(CHUNK_SIZE);
+                        let mut i64_builder = arrow::array::Int64Builder::with_capacity(CHUNK_SIZE);
 
-                            std::hint::black_box(
-                                i64_builder.append_slice(std::hint::black_box(&values[start..end])),
-                            );
+                        std::hint::black_box(
+                            i32_builder.append_slice(std::hint::black_box(&ids[start..end])),
+                        );
+                        std::hint::black_box(
+                            i64_builder.append_slice(std::hint::black_box(&values[start..end])),
+                        );
+
+                        if end - start == CHUNK_SIZE {
+                            std::hint::black_box(i32_builder.finish());
+                            std::hint::black_box(i64_builder.finish());
+                        } else {
+                            std::hint::black_box((i32_builder, i64_builder));
                         }
-
-                        std::hint::black_box(i32_builder.finish());
-                        std::hint::black_box(i64_builder.finish());
-                    },
-                    BatchSize::SmallInput,
-                );
+                    }
+                });
             });
         }};
     }
