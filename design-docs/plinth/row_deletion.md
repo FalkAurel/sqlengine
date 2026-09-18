@@ -43,3 +43,20 @@ The latter one is therefore the approach that will be used from this point onwar
 
 > **Summary:** Addressing will be implemented according to `Case B` and have its validity tied to itself.
 
+
+## Designing an Index
+
+Fundamentally an index can be thought of as an integer value with semantical information tied to it. In C++ we often resort to implementing it via a type alias. This is fundamentally flawed, as the semantical relationship is not enforced by the compiler. More recently, the newtype-pattern has become common to partially enforce that relationship. But we still cannot express the concept that index `i` is tied to Table type `T` with lifetime `'a`.
+
+Our index implementation aims to fix that. The key question is: how do we manage lifetimes?
+
+RowID <'a, Schema>
+{
+    ...
+}
+
+## Modelling Deletion
+
+The table is represented as a linked list of contiguous memory blocks. Each block holds a fixed number of rows packed together. When the block is full, a new one is allocated and linked in. This way we never pay for reallocation of existing data — already allocated blocks stay where they are.
+
+Iteration walks contiguously within a block, then follows the pointer to the next. The cost of deletion fits naturally into this: we mark a row within its block as deleted without touching anything else.
