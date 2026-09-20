@@ -4,10 +4,10 @@ use std::{
 };
 
 use arrow::array::{Int32Builder, Int64Builder};
-use plinth::table::{
+use plinth::{RowMetadata, table::{
     Empty, Node, SliceFieldVisitor, SliceTableRow, StreamingTableRow, Table, TableBuilder,
     TableRow, VisitorError,
-};
+}};
 
 const N: usize = 1024 * 1024;
 const CHUNK_SIZE: usize = 64 * 1024;
@@ -19,6 +19,20 @@ fn main() {
 
 struct UserStream {
     values: Range<i32>,
+}
+
+struct Metadata;
+
+impl Metadata {
+    const fn new() -> Self {
+        Self
+    }
+}
+
+impl RowMetadata for Metadata {
+    fn is_alive(&self) -> bool {
+        true
+    }
 }
 
 impl TableRow for UserStream {
@@ -81,7 +95,7 @@ fn slice_append() {
     let mut table_total = Duration::ZERO;
 
     for _ in 0..10_000 {
-        let mut table: Table<SliceBatch<N>> = TableBuilder::default()
+        let mut table: Table<SliceBatch<N>, Metadata> = TableBuilder::default()
             .with_column::<i32>("ids")
             .unwrap()
             .with_column::<i64>("values")
@@ -90,7 +104,7 @@ fn slice_append() {
 
         let start = Instant::now();
 
-        std::hint::black_box(table.bulk_insert(&batch)).unwrap();
+        std::hint::black_box(table.bulk_insert(&batch, Metadata::new)).unwrap();
 
         table_total += start.elapsed();
 
@@ -128,7 +142,7 @@ fn arrow_append() {
 }
 
 fn streaming_append() {
-    let mut table: Table<UserStream> = TableBuilder::default()
+    let mut table: Table<UserStream, Metadata> = TableBuilder::default()
         .with_column::<i32>("values")
         .unwrap()
         .finish();
@@ -136,7 +150,7 @@ fn streaming_append() {
     for _ in 0..10_000 {
         std::hint::black_box(table.streaming_insert(UserStream {
             values: 0..N as i32,
-        }))
+        }, Metadata::new))
         .unwrap();
     }
 }

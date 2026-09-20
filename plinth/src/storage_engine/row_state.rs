@@ -15,9 +15,8 @@ use crate::{chunk::CHUNK_SIZE, units::LogicalOffset};
 /// storage engine's perspective. Other metadata, such as permissions or
 /// flags, can be added to concrete implementations without changing the
 /// row-state storage model.
-pub(crate) trait RowMetadata: Send + Sync + 'static {
-    #[inline(always)]
-    fn is_visible(&self) -> bool;
+pub trait RowMetadata: Send + Sync + 'static {
+    fn is_alive(&self) -> bool;
 }
 
 /// Default row metadata.
@@ -38,7 +37,7 @@ impl Default for DefaultRowMetadata {
 
 impl RowMetadata for DefaultRowMetadata {
     #[inline(always)]
-    fn is_visible(&self) -> bool {
+    fn is_alive(&self) -> bool {
         self.visibility.load(Ordering::Acquire)
     }
 }
@@ -58,14 +57,13 @@ impl<M: RowMetadata> RowState<M> {
         }
     }
 
+    #[inline]
     pub(crate) fn insert(mut self, entry: M) -> Self {
         match self.writer.insert(entry) {
             Ok(writer) => {
                 self.writer = writer;
             }
             Err((chunk, entry)) => {
-                // `insert` consumes the current writer. Restore `self.writer`
-                // before accessing any other part of `self`.
                 self.writer = Default::default();
 
                 self.freeze_chunk(chunk);
@@ -76,6 +74,7 @@ impl<M: RowMetadata> RowState<M> {
         self
     }
 
+    #[inline]
     fn freeze_chunk(&mut self, chunk: Box<[M; CHUNK_SIZE.as_usize()]>) {
         let new_tail: Arc<RowStateChunk<M>> = Arc::new(RowStateChunk {
             rows: Arc::from(chunk),
@@ -83,14 +82,14 @@ impl<M: RowMetadata> RowState<M> {
         });
 
         if let Some(tail) = self.tail.take() {
-            assert!(
+            debug_assert!(
                 tail.next.set(new_tail.clone()).is_ok(),
                 "RowStateChunk already has a successor"
             );
 
             self.tail = Some(new_tail);
         } else {
-            assert!(
+            debug_assert!(
                 self.start.set(new_tail.clone()).is_ok(),
                 "RowState already has a starting chunk"
             );
@@ -174,7 +173,7 @@ mod tests {
     }
 
     impl RowMetadata for TestMetadata {
-        fn is_visible(&self) -> bool {
+        fn is_alive(&self) -> bool {
             self.visibility.load(Ordering::Acquire)
         }
     }
@@ -208,22 +207,22 @@ mod tests {
     fn row_metadata_defaults_to_visible() {
         let row = DefaultRowMetadata::default();
 
-        assert!(row.is_visible());
+        assert!(row.is_alive());
     }
 
     #[test]
     fn row_metadata_visibility_can_change() {
         let row = DefaultRowMetadata::default();
 
-        assert!(row.is_visible());
+        assert!(row.is_alive());
 
         row.visibility.store(false, Ordering::Release);
 
-        assert!(!row.is_visible());
+        assert!(!row.is_alive());
 
         row.visibility.store(true, Ordering::Release);
 
-        assert!(row.is_visible());
+        assert!(row.is_alive());
     }
 
     #[test]
@@ -248,7 +247,7 @@ mod tests {
             let row = &start.rows[id];
 
             assert_eq!(row.id, id);
-            assert!(row.is_visible());
+            assert!(row.is_alive());
         }
 
         assert_eq!(state.writer.current.as_usize(), 1);
@@ -356,6 +355,6 @@ mod tests {
         let row = unsafe { state.writer.rows[0].assume_init_ref() };
 
         assert_eq!(row.id, 123);
-        assert!(!row.is_visible());
+        assert!(!row.is_alive());
     }
 }

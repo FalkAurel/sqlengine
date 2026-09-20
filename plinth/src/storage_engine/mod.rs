@@ -7,6 +7,7 @@ pub(crate) mod utility;
 pub(crate) mod vector;
 
 pub use chunk::{Append, AppendableType};
+pub use row_state::RowMetadata;
 
 #[cfg(feature = "bench")]
 pub mod benchmark;

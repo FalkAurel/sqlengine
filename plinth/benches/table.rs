@@ -1,6 +1,21 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use plinth::table::{Empty, Node, SliceTableRow, TableBuilder, TableRow};
+use plinth::{RowMetadata, table::{Empty, Node, SliceTableRow, TableBuilder, TableRow}};
 use std::mem::size_of;
+
+struct Metadata;
+
+impl Metadata {
+    const fn new() -> Self {
+        Self
+    }
+}
+
+impl RowMetadata for Metadata {
+    fn is_alive(&self) -> bool {
+        true
+    }
+}
+
 
 struct UserSlices<const N: usize> {
     ids: Box<[i32; N]>,
@@ -62,7 +77,7 @@ fn benchmark_mass_api_insertion(c: &mut Criterion) {
                             .finish::<UserSlices<N>>()
                     },
                     |table| {
-                        std::hint::black_box(table.bulk_insert(&input).unwrap());
+                        std::hint::black_box(table.bulk_insert(&input, Metadata::new).unwrap());
                     },
                     criterion::BatchSize::PerIteration,
                 );
