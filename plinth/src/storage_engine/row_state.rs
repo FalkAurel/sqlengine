@@ -1,6 +1,6 @@
 use std::{
     marker::PhantomData,
-    mem::MaybeUninit,
+    mem::{ManuallyDrop, MaybeUninit},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -81,30 +81,43 @@ impl<M: RowMetadata> RowState<M> {
             let slot = self.writer.current.as_usize();
             let remaining = CHUNK_SIZE.as_usize() - slot;
 
+            // Safety: MutableRowStateChunk is !Sync and we hold &mut self,
+            // so we are the sole accessor of the Arc's contents.
+            let base = Arc::as_ptr(&self.writer.rows) as *mut MaybeUninit<M>;
+
             if n <= remaining {
                 for i in 0..n {
-                    self.writer.rows[slot + i].write(f());
+                    unsafe { base.add(slot + i).write(MaybeUninit::new(f())) };
                 }
                 self.writer.current = self.writer.current + LogicalOffset::new(n as u64);
                 return self;
             }
 
             for i in 0..remaining {
-                self.writer.rows[slot + i].write(f());
+                unsafe { base.add(slot + i).write(MaybeUninit::new(f())) };
             }
             n -= remaining;
 
-            let full = std::mem::replace(&mut self.writer, Default::default());
-            let chunk: Box<[M; CHUNK_SIZE.as_usize()]> =
-                unsafe { std::mem::transmute(full.rows) };
+            // Swap in a fresh Arc for the next chunk's writer. The replace
+            // returns the now-full old Arc — cast it to initialized in-place,
+            // no copy, no extra allocation.
+            let full = std::mem::replace(
+                &mut self.writer.rows,
+                Arc::new([const { MaybeUninit::uninit() }; CHUNK_SIZE.as_usize()]),
+            );
+            self.writer.current = LogicalOffset::new(0);
+
+            let chunk: Arc<[M; CHUNK_SIZE.as_usize()]> = unsafe {
+                Arc::from_raw(Arc::into_raw(full) as *const [M; CHUNK_SIZE.as_usize()])
+            };
             self.freeze_chunk(chunk);
         }
     }
 
     #[inline]
-    fn freeze_chunk(&mut self, chunk: Box<[M; CHUNK_SIZE.as_usize()]>) {
+    fn freeze_chunk(&mut self, chunk: Arc<[M; CHUNK_SIZE.as_usize()]>) {
         let new_tail: Arc<RowStateChunk<M>> = Arc::new(RowStateChunk {
-            rows: Arc::from(chunk),
+            rows: chunk,
             next: OnceLock::new(),
         });
 
@@ -134,7 +147,10 @@ struct RowStateChunk<M: RowMetadata> {
 #[derive(Debug)]
 struct MutableRowStateChunk<M: RowMetadata> {
     current: LogicalOffset,
-    rows: Box<[MaybeUninit<M>; CHUNK_SIZE.as_usize()]>,
+    // Arc rather than Box so we can hand the allocation directly to
+    // RowStateChunk without a realloc+copy on freeze. We are the sole
+    // owner while current < CHUNK_SIZE; !Sync enforces no concurrent access.
+    rows: Arc<[MaybeUninit<M>; CHUNK_SIZE.as_usize()]>,
     _marker: PhantomData<*const ()>,
 }
 
@@ -144,7 +160,7 @@ impl<M: RowMetadata> Default for MutableRowStateChunk<M> {
     fn default() -> Self {
         Self {
             current: LogicalOffset::new(0),
-            rows: Box::new([const { MaybeUninit::uninit() }; CHUNK_SIZE.as_usize()]),
+            rows: Arc::new([const { MaybeUninit::uninit() }; CHUNK_SIZE.as_usize()]),
             _marker: PhantomData,
         }
     }
@@ -152,11 +168,15 @@ impl<M: RowMetadata> Default for MutableRowStateChunk<M> {
 
 impl<M: RowMetadata> MutableRowStateChunk<M> {
     #[inline(always)]
-    fn insert(mut self, entry: M) -> Result<Self, (Box<[M; CHUNK_SIZE.as_usize()]>, M)> {
+    fn insert(mut self, entry: M) -> Result<Self, (Arc<[M; CHUNK_SIZE.as_usize()]>, M)> {
         let index: usize = self.current.as_usize();
 
         if index < CHUNK_SIZE.as_usize() {
-            self.rows[index].write(entry);
+            // Safety: sole owner, !Sync enforces no concurrent access.
+            unsafe {
+                let ptr = Arc::as_ptr(&self.rows) as *mut MaybeUninit<M>;
+                ptr.add(index).write(MaybeUninit::new(entry));
+            }
             self.current = self.current + LogicalOffset::new(1);
 
             Ok(self)
@@ -167,14 +187,20 @@ impl<M: RowMetadata> MutableRowStateChunk<M> {
                 "MutableRowStateChunk cannot advance beyond a full chunk"
             );
 
-            let rows: Box<[M; CHUNK_SIZE.as_usize()]> = unsafe {
-                std::mem::transmute::<
-                    Box<[MaybeUninit<M>; CHUNK_SIZE.as_usize()]>,
-                    Box<[M; CHUNK_SIZE.as_usize()]>,
-                >(self.rows)
+            // Wrap self in ManuallyDrop so the Arc isn't dropped when we
+            // extract it. ptr::read copies the Arc pointer without touching
+            // the reference count; ManuallyDrop ensures no destructor runs.
+            let md = ManuallyDrop::new(self);
+            let rows: Arc<[MaybeUninit<M>; CHUNK_SIZE.as_usize()]> =
+                unsafe { std::ptr::read(&md.rows) };
+
+            // Reinterpret the fully-written Arc as initialized — same allocation,
+            // same address, no copy.
+            let chunk: Arc<[M; CHUNK_SIZE.as_usize()]> = unsafe {
+                Arc::from_raw(Arc::into_raw(rows) as *const [M; CHUNK_SIZE.as_usize()])
             };
 
-            Err((rows, entry))
+            Err((chunk, entry))
         }
     }
 }
