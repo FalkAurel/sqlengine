@@ -43,3 +43,5 @@ The latter one is therefore the approach that will be used from this point onwar
 
 > **Summary:** Addressing will be implemented according to `Case B` and have its validity tied to itself.
 
+## Designing a RowID
+
