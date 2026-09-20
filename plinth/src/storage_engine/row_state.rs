@@ -74,6 +74,33 @@ impl<M: RowMetadata> RowState<M> {
         self
     }
 
+    /// Inserts `n` metadata entries produced by `f`, filling chunk storage
+    /// in bulk rather than one call at a time.
+    pub(crate) fn insert_n(mut self, mut n: usize, f: &impl Fn() -> M) -> Self {
+        loop {
+            let slot = self.writer.current.as_usize();
+            let remaining = CHUNK_SIZE.as_usize() - slot;
+
+            if n <= remaining {
+                for i in 0..n {
+                    self.writer.rows[slot + i].write(f());
+                }
+                self.writer.current = self.writer.current + LogicalOffset::new(n as u64);
+                return self;
+            }
+
+            for i in 0..remaining {
+                self.writer.rows[slot + i].write(f());
+            }
+            n -= remaining;
+
+            let full = std::mem::replace(&mut self.writer, Default::default());
+            let chunk: Box<[M; CHUNK_SIZE.as_usize()]> =
+                unsafe { std::mem::transmute(full.rows) };
+            self.freeze_chunk(chunk);
+        }
+    }
+
     #[inline]
     fn freeze_chunk(&mut self, chunk: Box<[M; CHUNK_SIZE.as_usize()]>) {
         let new_tail: Arc<RowStateChunk<M>> = Arc::new(RowStateChunk {

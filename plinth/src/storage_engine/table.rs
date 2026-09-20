@@ -280,7 +280,7 @@ pub trait TableRow {
     fn commit<T: TableRow, M: RowMetadata, F: Fn() -> M>(
         table: &mut Table<T, M>,
         f: F,
-        mut num_elements: LogicalSize,
+        num_elements: LogicalSize,
         mut writes: SmallVec<[PendingWrite; 10]>,
     ) {
         while let Some(PendingWrite { index, callback }) = writes.pop() {
@@ -288,12 +288,12 @@ pub trait TableRow {
                 .expect("Terminating Program: Datastorage has been corrupted. Verify if your index mapping is actually mapping to the right column type.")
         }
 
-        let mut metadata: RowState<M> = table.metadata.take().expect("Table is in invalid state. Either concurrent writes are happening or TableBuilder failed");
+        let metadata = table
+            .metadata
+            .take()
+            .expect("Table is in invalid state. Either concurrent writes are happening or TableBuilder failed");
 
-        while num_elements.get() > 0 {
-            metadata = metadata.insert(f());
-            num_elements = LogicalSize::new(num_elements.get() - 1);
-        }
+        table.metadata = Some(metadata.insert_n(num_elements.as_usize(), &f));
     }
 }
 
@@ -311,7 +311,11 @@ pub trait TableRow {
 /// # Example
 ///
 /// ```
-/// use plinth::storage_engine::table::{Empty, FieldVisitor, Node, RowInsert, TableBuilder, TableRow};
+/// use plinth::RowMetadata;
+/// use plinth::storage_engine::table::{Empty, FieldVisitor, Node, RowInsert, Table, TableBuilder, TableRow};
+///
+/// struct Metadata;
+/// impl RowMetadata for Metadata { fn is_alive(&self) -> bool { true } }
 ///
 /// struct UserRow { id: i32, age: u8 }
 ///
@@ -328,7 +332,7 @@ pub trait TableRow {
 ///     }
 /// }
 ///
-/// let mut table = TableBuilder::default()
+/// let mut table: Table<UserRow, Metadata> = TableBuilder::default()
 ///     .with_column::<i32>("id").unwrap()
 ///     .with_column::<u8>("age").unwrap()
 ///     .finish::<UserRow>();
@@ -355,10 +359,14 @@ pub trait RowInsert: TableRow {
 /// # Example
 ///
 /// ```
+/// use plinth::RowMetadata;
 /// use plinth::storage_engine::table::{
-///     Empty, Node, StreamingFieldVisitor, StreamingTableRow, TableBuilder, TableRow,
+///     Empty, Node, StreamingFieldVisitor, StreamingTableRow, Table, TableBuilder, TableRow,
 ///     VisitorError,
 /// };
+///
+/// struct Metadata;
+/// impl RowMetadata for Metadata { fn is_alive(&self) -> bool { true } }
 ///
 /// struct UserRow { id: i32, age: u8 }
 ///
@@ -388,7 +396,7 @@ pub trait RowInsert: TableRow {
 ///     }
 /// }
 ///
-/// let mut table = TableBuilder::default()
+/// let mut table: Table<UserRow, Metadata> = TableBuilder::default()
 ///     .with_column::<i32>("id").unwrap()
 ///     .with_column::<u8>("age").unwrap()
 ///     .finish::<UserRow>();
@@ -398,7 +406,7 @@ pub trait RowInsert: TableRow {
 ///     ages: Box::new([20u8, 25, 30].into_iter()),
 /// };
 ///
-/// table.streaming_insert(stream).unwrap();
+/// table.streaming_insert(stream, || Metadata).unwrap();
 /// ```
 pub trait StreamingTableRow: TableRow {
     fn visit_columns_streaming<'a, V: StreamingFieldVisitor<'a>>(
@@ -423,9 +431,13 @@ pub trait StreamingTableRow: TableRow {
 /// # Example
 ///
 /// ```
+/// use plinth::RowMetadata;
 /// use plinth::storage_engine::table::{
-///     Empty, Node, SliceFieldVisitor, SliceTableRow, TableBuilder, TableRow, VisitorError
+///     Empty, Node, SliceFieldVisitor, SliceTableRow, Table, TableBuilder, TableRow, VisitorError
 /// };
+///
+/// struct Metadata;
+/// impl RowMetadata for Metadata { fn is_alive(&self) -> bool { true } }
 ///
 /// struct UserRow { id: i32, age: u8 }
 ///
@@ -468,7 +480,7 @@ pub trait StreamingTableRow: TableRow {
 ///     }
 /// }
 ///
-/// let mut table = TableBuilder::default()
+/// let mut table: Table<UserRow, Metadata> = TableBuilder::default()
 ///     .with_column::<i32>("id").unwrap()
 ///     .with_column::<u8>("age").unwrap()
 ///     .finish::<UserRow>();
@@ -478,7 +490,7 @@ pub trait StreamingTableRow: TableRow {
 ///     vec![20, 25, 30],
 /// ).expect("column lengths must match");
 ///
-/// table.bulk_insert(&batch);
+/// table.bulk_insert(&batch, || Metadata).unwrap();
 /// ```
 pub trait SliceTableRow<const N: usize>: TableRow {
     fn visit_columns_slice<'a, V: SliceFieldVisitor<'a, N>>(

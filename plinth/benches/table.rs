@@ -2,17 +2,21 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use plinth::{RowMetadata, table::{Empty, Node, SliceTableRow, TableBuilder, TableRow}};
 use std::mem::size_of;
 
-struct Metadata;
+struct Metadata {
+    is_alive: bool
+}
 
 impl Metadata {
     const fn new() -> Self {
-        Self
+        Self {
+            is_alive: true
+        }
     }
 }
 
 impl RowMetadata for Metadata {
     fn is_alive(&self) -> bool {
-        true
+        self.is_alive
     }
 }
 
@@ -48,7 +52,7 @@ fn benchmark_mass_api_insertion(c: &mut Criterion) {
         ($n:expr) => {{
             const N: usize = $n;
 
-            let bytes = (N * (size_of::<i32>() + size_of::<i64>())) as u64;
+            let bytes = (N * (size_of::<i32>() + size_of::<i64>()) + size_of::<bool>()) as u64;
 
             group.throughput(Throughput::Bytes(bytes));
 
