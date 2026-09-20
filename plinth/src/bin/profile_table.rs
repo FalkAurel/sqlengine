@@ -4,10 +4,13 @@ use std::{
 };
 
 use arrow::array::{Int32Builder, Int64Builder};
-use plinth::{RowMetadata, table::{
-    Empty, Node, SliceFieldVisitor, SliceTableRow, StreamingTableRow, Table, TableBuilder,
-    TableRow, VisitorError,
-}};
+use plinth::{
+    RowMetadata,
+    table::{
+        Empty, Node, SliceFieldVisitor, SliceTableRow, StreamingTableRow, Table, TableBuilder,
+        TableRow, VisitorError,
+    },
+};
 
 const N: usize = 1024 * 1024;
 const CHUNK_SIZE: usize = 64 * 1024;
@@ -148,9 +151,12 @@ fn streaming_append() {
         .finish();
 
     for _ in 0..10_000 {
-        std::hint::black_box(table.streaming_insert(UserStream {
-            values: 0..N as i32,
-        }, Metadata::new))
+        std::hint::black_box(table.streaming_insert(
+            UserStream {
+                values: 0..N as i32,
+            },
+            Metadata::new,
+        ))
         .unwrap();
     }
 }

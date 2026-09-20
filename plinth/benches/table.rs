@@ -1,16 +1,17 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use plinth::{RowMetadata, table::{Empty, Node, SliceTableRow, TableBuilder, TableRow}};
+use plinth::{
+    RowMetadata,
+    table::{Empty, Node, SliceTableRow, TableBuilder, TableRow},
+};
 use std::mem::size_of;
 
 struct Metadata {
-    is_alive: bool
+    is_alive: bool,
 }
 
 impl Metadata {
     const fn new() -> Self {
-        Self {
-            is_alive: true
-        }
+        Self { is_alive: true }
     }
 }
 
@@ -19,7 +20,6 @@ impl RowMetadata for Metadata {
         self.is_alive
     }
 }
-
 
 struct UserSlices<const N: usize> {
     ids: Box<[i32; N]>,

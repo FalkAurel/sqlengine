@@ -293,7 +293,7 @@ pub trait TableRow {
             .take()
             .expect("Table is in invalid state. Either concurrent writes are happening or TableBuilder failed");
 
-        table.metadata = Some(metadata.insert_n(num_elements.as_usize(), &f));
+        table.metadata = Some(metadata.insert_n(num_elements, &f));
     }
 }
 
@@ -646,7 +646,7 @@ impl<T: TableRow, M: RowMetadata> Table<T, M> {
 #[cfg(test)]
 mod test {
     use crate::{
-        row_state::DefaultRowMetadata,
+        RowMetadata,
         storage_engine::{
             table::{
                 Empty, FieldVisitor, Node, RowInsert, SliceFieldVisitor, SliceTableRow,
@@ -655,6 +655,15 @@ mod test {
             units::LogicalSize,
         },
     };
+
+    #[derive(Default)]
+    struct DefaultRowMetadata;
+
+    impl RowMetadata for DefaultRowMetadata {
+        fn is_alive(&self) -> bool {
+            true
+        }
+    }
 
     struct UserRow;
 
