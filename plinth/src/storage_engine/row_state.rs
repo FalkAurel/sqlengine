@@ -36,7 +36,7 @@ impl<M: RowMetadata> RowState<M> {
 
     /// Inserts `n` metadata entries produced by `f`, filling chunk storage
     /// in bulk rather than one call at a time.
-    pub(crate) fn insert_n(mut self, n: LogicalSize, f: &impl Fn() -> M) -> Self {
+    pub(crate) fn insert_n(mut self, n: LogicalSize, f: impl Fn() -> M) -> Self {
         match self.writer.insert_n(&f, n) {
             Ok(writer) => {
                 self.writer = writer;
@@ -64,16 +64,14 @@ impl<M: RowMetadata> RowState<M> {
                 tail.next.set(new_tail.clone()).is_ok(),
                 "RowStateChunk already has a successor"
             );
-
-            self.tail = Some(new_tail);
         } else {
             debug_assert!(
                 self.start.set(new_tail.clone()).is_ok(),
                 "RowState already has a starting chunk"
             );
-
-            self.tail = Some(new_tail);
         }
+
+        self.tail = Some(new_tail);
     }
 }
 
@@ -100,6 +98,7 @@ impl<M: RowMetadata> Default for MutableRowStateChunk<M> {
     fn default() -> Self {
         Self {
             current: LogicalOffset::new(0),
+            // This is safe because uninit data has no valid bit-pattern to begin with so the invariant is trivially true
             rows: unsafe { Arc::new_uninit().assume_init() },
             _marker: PhantomData,
         }
@@ -303,19 +302,4 @@ mod tests {
             assert_eq!(rows[id].id, id);
         }
     }
-
-    // #[test]
-    // fn row_state_supports_custom_metadata() {
-    //     let mut state = RowState::<TestMetadata>::new();
-
-    //     state = state.insert(TestMetadata {
-    //         id: 123,
-    //         visibility: AtomicBool::new(false),
-    //     });
-
-    //     let row = unsafe { state.writer.rows[0].assume_init_ref() };
-
-    //     assert_eq!(row.id, 123);
-    //     assert!(!row.is_alive());
-    // }
 }
