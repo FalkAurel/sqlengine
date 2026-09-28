@@ -1010,7 +1010,7 @@ mod test {
                 .with_column::<u8>("age")
                 .unwrap()
                 .finish::<BulkInvalidStringIndex>();
-        table
+        let _ = table
             .bulk_insert(&BulkInvalidStringIndex, DefaultRowMetadata::default)
             .unwrap();
     }
@@ -1024,7 +1024,7 @@ mod test {
                 .with_column::<u8>("age")
                 .unwrap()
                 .finish::<BulkInvalidUsizeIndex>();
-        table
+        let _ = table
             .bulk_insert(&BulkInvalidUsizeIndex, DefaultRowMetadata::default)
             .unwrap();
     }
@@ -1037,7 +1037,7 @@ mod test {
             .with_column::<u8>("age")
             .unwrap()
             .finish::<BulkWrongType>();
-        table
+        let _ = table
             .bulk_insert(&BulkWrongType, DefaultRowMetadata::default)
             .unwrap();
     }
