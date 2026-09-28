@@ -44,7 +44,9 @@ mod tests {
     #[derive(Default)]
     struct Meta;
     impl RowMetadata for Meta {
-        fn is_alive(&self) -> bool { true }
+        fn is_alive(&self) -> bool {
+            true
+        }
     }
 
     struct Row;
@@ -105,9 +107,18 @@ mod tests {
     fn multiple_batches_accumulate_correct_total() {
         let mut table = make_table();
 
-        let a: Vec<_> = table.bulk_insert(&Batch([1, 2, 3]), Meta::default).unwrap().collect();
-        let b: Vec<_> = table.bulk_insert(&Batch([4, 5, 6]), Meta::default).unwrap().collect();
-        let c: Vec<_> = table.bulk_insert(&Batch([7]), Meta::default).unwrap().collect();
+        let a: Vec<_> = table
+            .bulk_insert(&Batch([1, 2, 3]), Meta::default)
+            .unwrap()
+            .collect();
+        let b: Vec<_> = table
+            .bulk_insert(&Batch([4, 5, 6]), Meta::default)
+            .unwrap()
+            .collect();
+        let c: Vec<_> = table
+            .bulk_insert(&Batch([7]), Meta::default)
+            .unwrap()
+            .collect();
 
         assert_eq!(a.len(), 3);
         assert_eq!(b.len(), 3);
