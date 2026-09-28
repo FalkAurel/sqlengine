@@ -265,7 +265,7 @@ mod tests {
 
         let second = first.next.get().expect("second chunk should be linked");
 
-        assert!(second.next.get().is_some() == false);
+        assert!(!second.next.get().is_some());
 
         for id in 0..CHUNK_SIZE.as_usize() {
             assert_eq!(first.rows[id].id, id);
