@@ -1,6 +1,8 @@
 use std::{collections::HashMap, marker::PhantomData};
 
 use crate::{
+    row_index::RowIndex,
+    row_state::{RowMetadata, RowState},
     storage_engine::{
         chunk::{Append, AppendableType},
         column::{Column, InvalidDowncast},
@@ -15,8 +17,11 @@ use crate::{
 
 mod sealed {
     use crate::{
-        storage_engine::table::{Table, TableRow},
-        storage_engine::units::LogicalOffset,
+        row_state::RowMetadata,
+        storage_engine::{
+            table::{Table, TableRow},
+            units::LogicalOffset,
+        },
     };
 
     #[derive(Debug)]
@@ -24,13 +29,19 @@ mod sealed {
 
     pub trait Index {
         #[allow(private_interfaces)]
-        fn resolve<T: TableRow>(&self, table: &Table<T>) -> Result<LogicalOffset, IndexNotFound>;
+        fn resolve<T: TableRow, M: RowMetadata>(
+            &self,
+            table: &Table<T, M>,
+        ) -> Result<LogicalOffset, IndexNotFound>;
     }
 
     impl Index for &'static str {
         #[allow(private_interfaces)]
         #[inline(always)]
-        fn resolve<T: TableRow>(&self, table: &Table<T>) -> Result<LogicalOffset, IndexNotFound> {
+        fn resolve<T: TableRow, M: RowMetadata>(
+            &self,
+            table: &Table<T, M>,
+        ) -> Result<LogicalOffset, IndexNotFound> {
             table
                 .column_resolver
                 .get(self)
@@ -42,7 +53,10 @@ mod sealed {
     impl Index for usize {
         #[allow(private_interfaces)]
         #[inline(always)]
-        fn resolve<T: TableRow>(&self, table: &Table<T>) -> Result<LogicalOffset, IndexNotFound> {
+        fn resolve<T: TableRow, M: RowMetadata>(
+            &self,
+            table: &Table<T, M>,
+        ) -> Result<LogicalOffset, IndexNotFound> {
             if *self < table.columns.len() {
                 Ok(LogicalOffset::new(*self as u64))
             } else {
@@ -122,11 +136,11 @@ pub trait SliceFieldVisitor<'a, const N: usize> {
     ) -> Result<(), VisitorError>;
 }
 
-pub(crate) struct SingleFieldVisitor<'a, T: TableRow> {
-    table: &'a mut Table<T>,
+pub(crate) struct SingleFieldVisitor<'a, T: TableRow, M: RowMetadata> {
+    table: &'a mut Table<T, M>,
 }
 
-impl<'a, T: TableRow> FieldVisitor for SingleFieldVisitor<'a, T> {
+impl<'a, T: TableRow, M: RowMetadata> FieldVisitor for SingleFieldVisitor<'a, T, M> {
     fn visit_field<I: Index, V: AppendableType>(
         &mut self,
         index: I,
@@ -144,21 +158,13 @@ impl<'a, T: TableRow> FieldVisitor for SingleFieldVisitor<'a, T> {
     }
 }
 
-pub(crate) struct StreamingVisitor<'a, T: TableRow> {
-    table: &'a mut Table<T>,
+pub(crate) struct StreamingVisitor<'a, T: TableRow, M: RowMetadata> {
+    table: &'a mut Table<T, M>,
     expected_len: Option<LogicalSize>,
     iterators: SmallVec<[PendingWrite<'a>; 10]>,
 }
 
-impl<'a, T: TableRow> StreamingVisitor<'a, T> {
-    fn commit(mut self) {
-        while let Some(PendingWrite { index, callback }) = self.iterators.pop() {
-            callback(T::get_column_mut(self.table, index).expect("The Index Resolution is cooked"))
-                .expect("Terminating Program: Datastorage has been corrupted. Verify if your index mapping is actually mapping to the right column type.")
-        }
-    }
-}
-impl<'a, T: TableRow> StreamingFieldVisitor<'a> for StreamingVisitor<'a, T> {
+impl<'a, T: TableRow, M: RowMetadata> StreamingFieldVisitor<'a> for StreamingVisitor<'a, T, M> {
     fn visit_fields<'iterator: 'a, I: Index, V: AppendableType>(
         &mut self,
         index: I,
@@ -192,21 +198,33 @@ impl<'a, T: TableRow> StreamingFieldVisitor<'a> for StreamingVisitor<'a, T> {
     }
 }
 
-pub(crate) struct SliceVisitor<'a, T: TableRow> {
-    table: &'a mut Table<T>,
+pub(crate) struct SliceVisitor<'a, T: TableRow, M: RowMetadata> {
+    table: &'a mut Table<T, M>,
     iterators: SmallVec<[PendingWrite<'a>; 10]>,
 }
 
-impl<'a, T: TableRow> SliceVisitor<'a, T> {
-    fn commit(mut self) {
-        while let Some(PendingWrite { index, callback }) = self.iterators.pop() {
-            callback(T::get_column_mut(self.table, index).expect("The Index Resolution is cooked"))
-                .expect("Terminating Program: Datastorage has been corrupted. Verify if your index mapping is actually mapping to the right column type.")
-        }
-    }
-}
+// impl<'a, T: TableRow, M: RowMetadata> SliceVisitor<'a, T, M> {
+//     fn commit<F: Fn() -> M>(mut self, f: F, mut num_elements: LogicalSize) {
+//         while let Some(PendingWrite { index, callback }) = self.iterators.pop() {
+//             callback(T::get_column_mut(self.table, index).expect("The Index Resolution is cooked"))
+//                 .expect("Terminating Program: Datastorage has been corrupted. Verify if your index mapping is actually mapping to the right column type.")
+//         }
 
-impl<'a, const N: usize, T: TableRow> SliceFieldVisitor<'a, N> for SliceVisitor<'a, T> {
+//         let mut metadata: RowState<M> = self.table
+//         .metadata
+//         .take()
+//         .expect("There should always be a table there. This suggest either invalid creation or concurrent write access. Both should be impossible in safe rust.");
+
+//         while num_elements.as_usize() > 0 {
+//             metadata = metadata.insert(f());
+//             num_elements = LogicalSize::new(num_elements.get() - 1);
+//         }
+//     }
+// }
+
+impl<'a, const N: usize, T: TableRow, M: RowMetadata> SliceFieldVisitor<'a, N>
+    for SliceVisitor<'a, T, M>
+{
     #[inline(always)]
     fn visit_slice<'slice: 'a, I: Index, V: AppendableType>(
         &mut self,
@@ -247,14 +265,41 @@ pub trait TableRow {
     type Schema: SchemaList;
 
     #[allow(private_interfaces)]
-    fn get_column_mut<T: TableRow>(
-        table: &mut Table<T>,
+    fn get_column_mut<T: TableRow, M: RowMetadata>(
+        table: &mut Table<T, M>,
         offset: LogicalOffset,
     ) -> Result<&mut Column, IndexNotFound> {
         table
             .columns
             .get_mut(offset.as_usize())
             .ok_or(IndexNotFound)
+    }
+
+    #[inline(always)]
+    #[allow(private_interfaces)]
+    fn commit<'table, T: TableRow, M: RowMetadata, F: Fn() -> M>(
+        table: &mut Table<T, M>,
+        f: F,
+        num_elements: LogicalSize,
+        mut writes: SmallVec<[PendingWrite; 10]>,
+    ) -> impl Iterator<Item = RowIndex<'table, Self::Schema>> + use<'table, Self, T, M, F>
+    where
+        <Self as TableRow>::Schema: 'table,
+    {
+        while let Some(PendingWrite { index, callback }) = writes.pop() {
+            callback(T::get_column_mut(table, index).expect("The Index Resolution is cooked"))
+                .expect("Terminating Program: Datastorage has been corrupted. Verify if your index mapping is actually mapping to the right column type.")
+        }
+
+        let metadata = table
+            .metadata
+            .take()
+            .expect("Table is in invalid state. Either concurrent writes are happening or TableBuilder failed");
+
+        let (metadata, index_generator) = metadata.insert_n::<Self::Schema>(num_elements, f);
+        table.metadata = Some(metadata);
+
+        index_generator
     }
 }
 
@@ -272,7 +317,11 @@ pub trait TableRow {
 /// # Example
 ///
 /// ```
-/// use plinth::storage_engine::table::{Empty, FieldVisitor, Node, RowInsert, TableBuilder, TableRow};
+/// use plinth::RowMetadata;
+/// use plinth::storage_engine::table::{Empty, FieldVisitor, Node, RowInsert, Table, TableBuilder, TableRow};
+///
+/// struct Metadata;
+/// impl RowMetadata for Metadata { fn is_alive(&self) -> bool { true } }
 ///
 /// struct UserRow { id: i32, age: u8 }
 ///
@@ -289,7 +338,7 @@ pub trait TableRow {
 ///     }
 /// }
 ///
-/// let mut table = TableBuilder::default()
+/// let mut table: Table<UserRow, Metadata> = TableBuilder::default()
 ///     .with_column::<i32>("id").unwrap()
 ///     .with_column::<u8>("age").unwrap()
 ///     .finish::<UserRow>();
@@ -316,10 +365,14 @@ pub trait RowInsert: TableRow {
 /// # Example
 ///
 /// ```
+/// use plinth::RowMetadata;
 /// use plinth::storage_engine::table::{
-///     Empty, Node, StreamingFieldVisitor, StreamingTableRow, TableBuilder, TableRow,
+///     Empty, Node, StreamingFieldVisitor, StreamingTableRow, Table, TableBuilder, TableRow,
 ///     VisitorError,
 /// };
+///
+/// struct Metadata;
+/// impl RowMetadata for Metadata { fn is_alive(&self) -> bool { true } }
 ///
 /// struct UserRow { id: i32, age: u8 }
 ///
@@ -349,7 +402,7 @@ pub trait RowInsert: TableRow {
 ///     }
 /// }
 ///
-/// let mut table = TableBuilder::default()
+/// let mut table: Table<UserRow, Metadata> = TableBuilder::default()
 ///     .with_column::<i32>("id").unwrap()
 ///     .with_column::<u8>("age").unwrap()
 ///     .finish::<UserRow>();
@@ -359,7 +412,7 @@ pub trait RowInsert: TableRow {
 ///     ages: Box::new([20u8, 25, 30].into_iter()),
 /// };
 ///
-/// table.streaming_insert(stream).unwrap();
+/// table.streaming_insert(stream, || Metadata).unwrap();
 /// ```
 pub trait StreamingTableRow: TableRow {
     fn visit_columns_streaming<'a, V: StreamingFieldVisitor<'a>>(
@@ -384,9 +437,13 @@ pub trait StreamingTableRow: TableRow {
 /// # Example
 ///
 /// ```
+/// use plinth::RowMetadata;
 /// use plinth::storage_engine::table::{
-///     Empty, Node, SliceFieldVisitor, SliceTableRow, TableBuilder, TableRow, VisitorError
+///     Empty, Node, SliceFieldVisitor, SliceTableRow, Table, TableBuilder, TableRow, VisitorError
 /// };
+///
+/// struct Metadata;
+/// impl RowMetadata for Metadata { fn is_alive(&self) -> bool { true } }
 ///
 /// struct UserRow { id: i32, age: u8 }
 ///
@@ -429,7 +486,7 @@ pub trait StreamingTableRow: TableRow {
 ///     }
 /// }
 ///
-/// let mut table = TableBuilder::default()
+/// let mut table: Table<UserRow, Metadata> = TableBuilder::default()
 ///     .with_column::<i32>("id").unwrap()
 ///     .with_column::<u8>("age").unwrap()
 ///     .finish::<UserRow>();
@@ -439,7 +496,7 @@ pub trait StreamingTableRow: TableRow {
 ///     vec![20, 25, 30],
 /// ).expect("column lengths must match");
 ///
-/// table.bulk_insert(&batch);
+/// table.bulk_insert(&batch, || Metadata).unwrap();
 /// ```
 pub trait SliceTableRow<const N: usize>: TableRow {
     fn visit_columns_slice<'a, V: SliceFieldVisitor<'a, N>>(
@@ -473,27 +530,29 @@ pub struct DuplicateField;
 /// only compiles when the accumulated schema exactly matches `T::Schema` for the
 /// target row type — a mismatch or wrong column order is a type error, not a
 /// runtime panic.
-pub struct TableBuilder<Schema> {
+pub struct TableBuilder<Schema, M: RowMetadata> {
     columns: SmallVec<[Column; 10]>,
     column_resolver: HashMap<&'static str, LogicalOffset>,
     _schema: PhantomData<Schema>,
+    _metadata: PhantomData<M>,
 }
 
-impl Default for TableBuilder<Empty> {
+impl<M: RowMetadata> Default for TableBuilder<Empty, M> {
     fn default() -> Self {
         Self {
             columns: SmallVec::new(),
             column_resolver: HashMap::new(),
             _schema: PhantomData,
+            _metadata: PhantomData,
         }
     }
 }
 
-impl<Schema: SchemaList> TableBuilder<Schema> {
+impl<Schema: SchemaList, M: RowMetadata> TableBuilder<Schema, M> {
     pub fn with_column<V: AppendableType>(
         mut self,
         id: &'static str,
-    ) -> Result<TableBuilder<Node<V, Schema>>, DuplicateField> {
+    ) -> Result<TableBuilder<Node<V, Schema>, M>, DuplicateField> {
         if self.column_resolver.contains_key(id) {
             return Err(DuplicateField);
         }
@@ -508,71 +567,118 @@ impl<Schema: SchemaList> TableBuilder<Schema> {
             columns: self.columns,
             column_resolver: self.column_resolver,
             _schema: PhantomData,
+            _metadata: PhantomData,
         })
     }
 
-    pub fn finish<T: TableRow<Schema = Schema>>(self) -> Table<T> {
+    pub fn finish<T: TableRow<Schema = Schema>>(self) -> Table<T, M> {
         Table {
             columns: self.columns.into_boxed_slice(),
             column_resolver: self.column_resolver,
+            metadata: Some(RowState::new()),
             _marker: PhantomData,
         }
     }
 }
 
-pub struct Table<T: TableRow> {
+pub struct Table<T: TableRow, M: RowMetadata> {
     columns: Box<[Column]>,
     column_resolver: HashMap<&'static str, LogicalOffset>,
+    metadata: Option<RowState<M>>,
     _marker: PhantomData<T>,
 }
 
-impl<T: RowInsert> Table<T> {
+impl<T: RowInsert, M: RowMetadata> Table<T, M> {
     pub fn insert(&mut self, value: T) {
         let mut visitor = SingleFieldVisitor { table: self };
         value.visit_fields(&mut visitor);
     }
 }
 
-impl<T: TableRow> Table<T> {
-    pub fn streaming_insert<S: StreamingTableRow<Schema = T::Schema>>(
+impl<T: TableRow, M: RowMetadata> Table<T, M> {
+    pub fn streaming_insert<'table, S: StreamingTableRow<Schema = T::Schema>, F: Fn() -> M>(
         &mut self,
         source: S,
-    ) -> Result<(), VisitorError> {
-        let mut visitor: StreamingVisitor<'_, T> = StreamingVisitor {
+        f: F,
+    ) -> Result<impl Iterator<Item = RowIndex<'table, T::Schema>>, VisitorError>
+    where
+        Self: 'table,
+    {
+        let mut visitor: StreamingVisitor<'_, T, M> = StreamingVisitor {
             table: self,
             iterators: SmallVec::new(),
             expected_len: None,
         };
         source.visit_columns_streaming(&mut visitor)?;
-        visitor.commit();
-        Ok(())
+
+        let StreamingVisitor {
+            table,
+            expected_len,
+            iterators,
+        } = visitor;
+
+        Ok(T::commit(
+            table,
+            f,
+            LogicalSize::new(expected_len.map(|inner| inner.get()).unwrap_or(0)),
+            iterators,
+        ))
     }
 
     #[inline(never)]
-    pub fn bulk_insert<const NUM_ROWS: usize, S: SliceTableRow<NUM_ROWS, Schema = T::Schema>>(
+    pub fn bulk_insert<
+        'table,
+        const NUM_ROWS: usize,
+        S: SliceTableRow<NUM_ROWS, Schema = T::Schema>,
+        F: Fn() -> M,
+    >(
         &mut self,
         source: &S,
-    ) -> Result<(), VisitorError> {
-        let mut visitor: SliceVisitor<T> = SliceVisitor {
+        f: F,
+    ) -> Result<impl Iterator<Item = RowIndex<'table, T::Schema>>, VisitorError>
+    where
+        Self: 'table,
+    {
+        let mut visitor: SliceVisitor<T, M> = SliceVisitor {
             table: self,
             iterators: SmallVec::new(),
         };
-        source.visit_columns_slice::<SliceVisitor<T>>(&mut visitor)?;
-        visitor.commit();
+        source.visit_columns_slice::<SliceVisitor<T, M>>(&mut visitor)?;
 
-        Ok(())
+        let SliceVisitor {
+            table, iterators, ..
+        } = visitor;
+
+        Ok(T::commit(
+            table,
+            f,
+            LogicalSize::new(NUM_ROWS as u64),
+            iterators,
+        ))
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::storage_engine::{
-        table::{
-            Empty, FieldVisitor, Node, RowInsert, SliceFieldVisitor, SliceTableRow,
-            StreamingFieldVisitor, StreamingTableRow, TableBuilder, TableRow, VisitorError,
+    use crate::{
+        RowMetadata,
+        storage_engine::{
+            table::{
+                Empty, FieldVisitor, Node, RowInsert, SliceFieldVisitor, SliceTableRow,
+                StreamingFieldVisitor, StreamingTableRow, TableBuilder, TableRow, VisitorError,
+            },
+            units::LogicalSize,
         },
-        units::LogicalSize,
     };
+
+    #[derive(Default)]
+    struct DefaultRowMetadata;
+
+    impl RowMetadata for DefaultRowMetadata {
+        fn is_alive(&self) -> bool {
+            true
+        }
+    }
 
     struct UserRow;
 
@@ -600,7 +706,7 @@ mod test {
         }
     }
 
-    fn make_table() -> super::Table<UserRow> {
+    fn make_table() -> super::Table<UserRow, DefaultRowMetadata> {
         TableBuilder::default()
             .with_column::<i32>("id")
             .unwrap()
@@ -616,7 +722,11 @@ mod test {
             ids: vec![1, 2, 3].into_iter(),
             ages: vec![20, 25, 30].into_iter(),
         };
-        assert!(table.streaming_insert(stream).is_ok());
+        assert!(
+            table
+                .streaming_insert(stream, DefaultRowMetadata::default)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -627,7 +737,7 @@ mod test {
             ages: vec![20, 25].into_iter(),
         };
         assert!(matches!(
-            table.streaming_insert(stream),
+            table.streaming_insert(stream, DefaultRowMetadata::default),
             Err(VisitorError::LengthMismatch { expected, got })
                 if expected == LogicalSize::new(3) && got == LogicalSize::new(2)
         ));
@@ -641,7 +751,7 @@ mod test {
             ages: vec![20, 25, 30].into_iter(),
         };
         assert!(matches!(
-            table.streaming_insert(stream),
+            table.streaming_insert(stream, DefaultRowMetadata::default),
             Err(VisitorError::LengthMismatch { expected, got })
                 if expected == LogicalSize::new(2) && got == LogicalSize::new(3)
         ));
@@ -654,7 +764,11 @@ mod test {
             ids: vec![].into_iter(),
             ages: vec![].into_iter(),
         };
-        assert!(table.streaming_insert(stream).is_ok());
+        assert!(
+            table
+                .streaming_insert(stream, DefaultRowMetadata::default)
+                .is_ok()
+        );
     }
 
     // --- wrong type writes ---
@@ -684,7 +798,7 @@ mod test {
             ids: vec![1i64, 2, 3].into_iter(),
         };
         assert!(matches!(
-            table.streaming_insert(stream),
+            table.streaming_insert(stream, DefaultRowMetadata::default),
             Err(VisitorError::InvalidDowncast(_))
         ));
     }
@@ -727,7 +841,7 @@ mod test {
     fn streaming_insert_unknown_string_index_returns_index_not_found() {
         let mut table = make_table();
         assert!(matches!(
-            table.streaming_insert(BadStringIndexStream),
+            table.streaming_insert(BadStringIndexStream, DefaultRowMetadata::default),
             Err(VisitorError::IndexNotFound(_))
         ));
     }
@@ -736,7 +850,7 @@ mod test {
     fn streaming_insert_out_of_bounds_usize_index_returns_index_not_found() {
         let mut table = make_table();
         assert!(matches!(
-            table.streaming_insert(BadUsizeIndexStream),
+            table.streaming_insert(BadUsizeIndexStream, DefaultRowMetadata::default),
             Err(VisitorError::IndexNotFound(_))
         ));
     }
@@ -790,29 +904,31 @@ mod test {
 
     #[test]
     fn insert_unknown_string_index_returns_index_not_found() {
-        let mut table = TableBuilder::default()
-            .with_column::<i32>("id")
-            .unwrap()
-            .with_column::<u8>("age")
-            .unwrap()
-            .finish::<InsertInvalidStringIndex>();
+        let mut table: super::Table<InsertInvalidStringIndex, DefaultRowMetadata> =
+            TableBuilder::default()
+                .with_column::<i32>("id")
+                .unwrap()
+                .with_column::<u8>("age")
+                .unwrap()
+                .finish::<InsertInvalidStringIndex>();
         table.insert(InsertInvalidStringIndex);
     }
 
     #[test]
     fn insert_out_of_bounds_usize_index_returns_index_not_found() {
-        let mut table = TableBuilder::default()
-            .with_column::<i32>("id")
-            .unwrap()
-            .with_column::<u8>("age")
-            .unwrap()
-            .finish::<InsertInvalidUsizeIndex>();
+        let mut table: super::Table<InsertInvalidUsizeIndex, DefaultRowMetadata> =
+            TableBuilder::default()
+                .with_column::<i32>("id")
+                .unwrap()
+                .with_column::<u8>("age")
+                .unwrap()
+                .finish::<InsertInvalidUsizeIndex>();
         table.insert(InsertInvalidUsizeIndex);
     }
 
     #[test]
     fn insert_wrong_type_returns_invalid_downcast() {
-        let mut table = TableBuilder::default()
+        let mut table: super::Table<InsertWrongType, DefaultRowMetadata> = TableBuilder::default()
             .with_column::<i32>("id")
             .unwrap()
             .with_column::<u8>("age")
@@ -887,34 +1003,42 @@ mod test {
 
     #[test]
     fn bulk_insert_unknown_string_index_returns_index_not_found() {
-        let mut table = TableBuilder::default()
-            .with_column::<i32>("id")
-            .unwrap()
-            .with_column::<u8>("age")
-            .unwrap()
-            .finish::<BulkInvalidStringIndex>();
-        table.bulk_insert(&BulkInvalidStringIndex).unwrap();
+        let mut table: super::Table<BulkInvalidStringIndex, DefaultRowMetadata> =
+            TableBuilder::default()
+                .with_column::<i32>("id")
+                .unwrap()
+                .with_column::<u8>("age")
+                .unwrap()
+                .finish::<BulkInvalidStringIndex>();
+        let _ = table
+            .bulk_insert(&BulkInvalidStringIndex, DefaultRowMetadata::default)
+            .unwrap();
     }
 
     #[test]
     fn bulk_insert_out_of_bounds_usize_index_returns_index_not_found() {
-        let mut table = TableBuilder::default()
-            .with_column::<i32>("id")
-            .unwrap()
-            .with_column::<u8>("age")
-            .unwrap()
-            .finish::<BulkInvalidUsizeIndex>();
-        table.bulk_insert(&BulkInvalidUsizeIndex).unwrap();
+        let mut table: super::Table<BulkInvalidUsizeIndex, DefaultRowMetadata> =
+            TableBuilder::default()
+                .with_column::<i32>("id")
+                .unwrap()
+                .with_column::<u8>("age")
+                .unwrap()
+                .finish::<BulkInvalidUsizeIndex>();
+        let _ = table
+            .bulk_insert(&BulkInvalidUsizeIndex, DefaultRowMetadata::default)
+            .unwrap();
     }
 
     #[test]
     fn bulk_insert_wrong_type_returns_invalid_downcast() {
-        let mut table = TableBuilder::default()
+        let mut table: super::Table<BulkWrongType, DefaultRowMetadata> = TableBuilder::default()
             .with_column::<i32>("id")
             .unwrap()
             .with_column::<u8>("age")
             .unwrap()
             .finish::<BulkWrongType>();
-        table.bulk_insert(&BulkWrongType).unwrap();
+        let _ = table
+            .bulk_insert(&BulkWrongType, DefaultRowMetadata::default)
+            .unwrap();
     }
 }

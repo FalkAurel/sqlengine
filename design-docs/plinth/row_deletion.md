@@ -43,7 +43,6 @@ The latter one is therefore the approach that will be used from this point onwar
 
 > **Summary:** Addressing will be implemented according to `Case B` and have its validity tied to itself.
 
-
 ## Designing an Index
 
 Fundamentally an index can be thought of as an integer value with semantical information tied to it. In C++ we often resort to implementing it via a type alias. This is fundamentally flawed, as the semantical relationship is not enforced by the compiler. More recently, the newtype-pattern has become common to partially enforce that relationship. But we still cannot express the concept that index `i` is tied to Table type `T` with lifetime `'a`.

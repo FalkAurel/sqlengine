@@ -1,6 +1,25 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use plinth::table::{Empty, Node, SliceTableRow, TableBuilder, TableRow};
+use plinth::{
+    RowMetadata,
+    table::{Empty, Node, SliceTableRow, TableBuilder, TableRow},
+};
 use std::mem::size_of;
+
+struct Metadata {
+    is_alive: bool,
+}
+
+impl Metadata {
+    const fn new() -> Self {
+        Self { is_alive: true }
+    }
+}
+
+impl RowMetadata for Metadata {
+    fn is_alive(&self) -> bool {
+        self.is_alive
+    }
+}
 
 struct UserSlices<const N: usize> {
     ids: Box<[i32; N]>,
@@ -33,7 +52,7 @@ fn benchmark_mass_api_insertion(c: &mut Criterion) {
         ($n:expr) => {{
             const N: usize = $n;
 
-            let bytes = (N * (size_of::<i32>() + size_of::<i64>())) as u64;
+            let bytes = (N * (size_of::<i32>() + size_of::<i64>()) + size_of::<bool>()) as u64;
 
             group.throughput(Throughput::Bytes(bytes));
 
@@ -62,7 +81,8 @@ fn benchmark_mass_api_insertion(c: &mut Criterion) {
                             .finish::<UserSlices<N>>()
                     },
                     |table| {
-                        std::hint::black_box(table.bulk_insert(&input).unwrap());
+                        let _ =
+                            std::hint::black_box(table.bulk_insert(&input, Metadata::new).unwrap());
                     },
                     criterion::BatchSize::PerIteration,
                 );
