@@ -81,7 +81,8 @@ fn benchmark_mass_api_insertion(c: &mut Criterion) {
                             .finish::<UserSlices<N>>()
                     },
                     |table| {
-                        let _ = std::hint::black_box(table.bulk_insert(&input, Metadata::new).unwrap());
+                        let _ =
+                            std::hint::black_box(table.bulk_insert(&input, Metadata::new).unwrap());
                     },
                     criterion::BatchSize::PerIteration,
                 );
