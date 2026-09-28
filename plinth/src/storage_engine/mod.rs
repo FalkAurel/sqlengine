@@ -1,5 +1,6 @@
 pub(crate) mod chunk;
 pub(crate) mod column;
+pub(crate) mod row_index;
 pub(crate) mod row_state;
 pub mod table;
 pub mod units;

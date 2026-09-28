@@ -1,6 +1,7 @@
 use std::{collections::HashMap, marker::PhantomData};
 
 use crate::{
+    row_index::RowIndex,
     row_state::{RowMetadata, RowState},
     storage_engine::{
         chunk::{Append, AppendableType},
@@ -276,12 +277,15 @@ pub trait TableRow {
 
     #[inline(always)]
     #[allow(private_interfaces)]
-    fn commit<T: TableRow, M: RowMetadata, F: Fn() -> M>(
+    fn commit<'table, T: TableRow, M: RowMetadata, F: Fn() -> M>(
         table: &mut Table<T, M>,
         f: F,
         num_elements: LogicalSize,
         mut writes: SmallVec<[PendingWrite; 10]>,
-    ) {
+    ) -> impl Iterator<Item = RowIndex<'table, Self::Schema>> + use<'table, Self, T, M, F>
+    where
+        <Self as TableRow>::Schema: 'table,
+    {
         while let Some(PendingWrite { index, callback }) = writes.pop() {
             callback(T::get_column_mut(table, index).expect("The Index Resolution is cooked"))
                 .expect("Terminating Program: Datastorage has been corrupted. Verify if your index mapping is actually mapping to the right column type.")
@@ -292,7 +296,10 @@ pub trait TableRow {
             .take()
             .expect("Table is in invalid state. Either concurrent writes are happening or TableBuilder failed");
 
-        table.metadata = Some(metadata.insert_n(num_elements, &f));
+        let (metadata, index_generator) = metadata.insert_n::<Self::Schema>(num_elements, f);
+        table.metadata = Some(metadata);
+
+        index_generator
     }
 }
 
@@ -589,11 +596,14 @@ impl<T: RowInsert, M: RowMetadata> Table<T, M> {
 }
 
 impl<T: TableRow, M: RowMetadata> Table<T, M> {
-    pub fn streaming_insert<S: StreamingTableRow<Schema = T::Schema>, F: Fn() -> M>(
+    pub fn streaming_insert<'table, S: StreamingTableRow<Schema = T::Schema>, F: Fn() -> M>(
         &mut self,
         source: S,
         f: F,
-    ) -> Result<(), VisitorError> {
+    ) -> Result<impl Iterator<Item = RowIndex<'table, T::Schema>>, VisitorError>
+    where
+        Self: 'table,
+    {
         let mut visitor: StreamingVisitor<'_, T, M> = StreamingVisitor {
             table: self,
             iterators: SmallVec::new(),
@@ -607,17 +617,17 @@ impl<T: TableRow, M: RowMetadata> Table<T, M> {
             iterators,
         } = visitor;
 
-        T::commit(
+        Ok(T::commit(
             table,
             f,
             LogicalSize::new(expected_len.map(|inner| inner.get()).unwrap_or(0)),
             iterators,
-        );
-        Ok(())
+        ))
     }
 
     #[inline(never)]
     pub fn bulk_insert<
+        'table,
         const NUM_ROWS: usize,
         S: SliceTableRow<NUM_ROWS, Schema = T::Schema>,
         F: Fn() -> M,
@@ -625,7 +635,10 @@ impl<T: TableRow, M: RowMetadata> Table<T, M> {
         &mut self,
         source: &S,
         f: F,
-    ) -> Result<(), VisitorError> {
+    ) -> Result<impl Iterator<Item = RowIndex<'table, T::Schema>>, VisitorError>
+    where
+        Self: 'table,
+    {
         let mut visitor: SliceVisitor<T, M> = SliceVisitor {
             table: self,
             iterators: SmallVec::new(),
@@ -636,9 +649,12 @@ impl<T: TableRow, M: RowMetadata> Table<T, M> {
             table, iterators, ..
         } = visitor;
 
-        T::commit(table, f, LogicalSize::new(NUM_ROWS as u64), iterators);
-
-        Ok(())
+        Ok(T::commit(
+            table,
+            f,
+            LogicalSize::new(NUM_ROWS as u64),
+            iterators,
+        ))
     }
 }
 

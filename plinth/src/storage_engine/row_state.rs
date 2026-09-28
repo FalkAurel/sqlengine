@@ -1,11 +1,14 @@
 use std::{
     marker::PhantomData,
     mem::MaybeUninit,
+    ops::Range,
     sync::{Arc, OnceLock},
 };
 
 use crate::{
     chunk::CHUNK_SIZE,
+    row_index::{RowIndex, RowIndexGenerator},
+    table::schema::SchemaList,
     units::{LogicalOffset, LogicalSize},
 };
 
@@ -20,6 +23,7 @@ pub trait RowMetadata: Send + Sync + 'static {
 }
 
 pub(crate) struct RowState<M: RowMetadata> {
+    size: LogicalSize,
     start: OnceLock<Arc<RowStateChunk<M>>>,
     tail: Option<Arc<RowStateChunk<M>>>,
     writer: MutableRowStateChunk<M>,
@@ -28,6 +32,7 @@ pub(crate) struct RowState<M: RowMetadata> {
 impl<M: RowMetadata> RowState<M> {
     pub(crate) fn new() -> Self {
         Self {
+            size: LogicalSize::new(0),
             start: OnceLock::new(),
             tail: None,
             writer: Default::default(),
@@ -36,7 +41,11 @@ impl<M: RowMetadata> RowState<M> {
 
     /// Inserts `n` metadata entries produced by `f`, filling chunk storage
     /// in bulk rather than one call at a time.
-    pub(crate) fn insert_n(mut self, n: LogicalSize, f: impl Fn() -> M) -> Self {
+    pub(crate) fn insert_n<'a, Schema: SchemaList + 'a>(
+        mut self,
+        n: LogicalSize,
+        f: impl Fn() -> M,
+    ) -> (Self, impl Iterator<Item = RowIndex<'a, Schema>>) {
         match self.writer.insert_n(&f, n) {
             Ok(writer) => {
                 self.writer = writer;
@@ -45,11 +54,17 @@ impl<M: RowMetadata> RowState<M> {
                 self.writer = Default::default();
 
                 self.freeze_chunk(chunk);
-                self = self.insert_n(remainder, f);
+                let (ret, _) = self.insert_n::<Schema>(remainder, f);
+                self = ret;
             }
         }
 
-        self
+        let range: Range<u64> = self.size.get()..(self.size + n).get();
+        let generator: RowIndexGenerator<Schema> = RowIndexGenerator::new(range);
+
+        self.size = self.size + n;
+
+        (self, generator)
     }
 
     #[inline]
@@ -136,6 +151,7 @@ impl<M: RowMetadata> MutableRowStateChunk<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_engine::table::schema::Empty;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Debug)]
@@ -174,8 +190,8 @@ mod tests {
 
     #[test]
     fn inserting_one_row_only_updates_mutable_writer() {
-        let state = RowState::<TestMetadata>::new()
-            .insert_n(LogicalSize::new(1), &Box::new(|| metadata(42)));
+        let (state, _) = RowState::<TestMetadata>::new()
+            .insert_n::<Empty>(LogicalSize::new(1), &Box::new(|| metadata(42)));
 
         // The chunk is not visible/frozen until it is full.
         assert!(state.start.get().is_none());
@@ -190,7 +206,8 @@ mod tests {
         let mut state = RowState::<TestMetadata>::new();
 
         for id in 0..CHUNK_SIZE.as_usize() + 1 {
-            state = state.insert_n(LogicalSize::new(1), &Box::new(move || metadata(id)));
+            (state, _) =
+                state.insert_n::<Empty>(LogicalSize::new(1), &Box::new(move || metadata(id)));
         }
 
         let start = state.start.get().expect("full chunk should be published");
@@ -218,10 +235,10 @@ mod tests {
         let mut state = RowState::<TestMetadata>::new();
 
         for id in 0..CHUNK_SIZE.as_usize() {
-            state = state.insert_n(LogicalSize::new(1), &Box::new(|| metadata(id)));
+            (state, _) = state.insert_n::<Empty>(LogicalSize::new(1), &Box::new(|| metadata(id)));
         }
 
-        state = state.insert_n(LogicalSize::new(1), &Box::new(|| metadata(42)));
+        (state, _) = state.insert_n::<Empty>(LogicalSize::new(1), &Box::new(|| metadata(42)));
 
         let start = state.start.get().expect("first chunk should be published");
 
@@ -241,7 +258,7 @@ mod tests {
         let total = CHUNK_SIZE.as_usize() * 2 + 1;
 
         for id in 0..total {
-            state = state.insert_n(LogicalSize::new(1), &Box::new(|| metadata(id)));
+            (state, _) = state.insert_n::<Empty>(LogicalSize::new(1), &Box::new(|| metadata(id)));
         }
 
         let first = state.start.get().expect("first chunk should be published");
@@ -271,7 +288,7 @@ mod tests {
         let mut state = RowState::<TestMetadata>::new();
 
         for id in 0..CHUNK_SIZE.as_usize() + 1 {
-            state = state.insert_n(LogicalSize::new(1), &Box::new(|| metadata(id)));
+            (state, _) = state.insert_n::<Empty>(LogicalSize::new(1), &Box::new(|| metadata(id)));
         }
 
         let start = state.start.get().expect("chunk should be published");

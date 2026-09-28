@@ -107,7 +107,7 @@ fn slice_append() {
 
         let start = Instant::now();
 
-        std::hint::black_box(table.bulk_insert(&batch, Metadata::new)).unwrap();
+        let _ = std::hint::black_box(table.bulk_insert(&batch, Metadata::new)).unwrap();
 
         table_total += start.elapsed();
 
@@ -151,7 +151,7 @@ fn streaming_append() {
         .finish();
 
     for _ in 0..10_000 {
-        std::hint::black_box(table.streaming_insert(
+        let _ = std::hint::black_box(table.streaming_insert(
             UserStream {
                 values: 0..N as i32,
             },
