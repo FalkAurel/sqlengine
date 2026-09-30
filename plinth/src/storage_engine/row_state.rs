@@ -46,6 +46,8 @@ impl<M: RowMetadata> RowState<M> {
         n: LogicalSize,
         f: impl Fn() -> M,
     ) -> (Self, impl Iterator<Item = RowIndex<'a, Schema>>) {
+        let range: Range<u64> = self.size.get()..(self.size + n).get();
+
         match self.writer.insert_n(&f, n) {
             Ok(writer) => {
                 self.writer = writer;
@@ -59,7 +61,6 @@ impl<M: RowMetadata> RowState<M> {
             }
         }
 
-        let range: Range<u64> = self.size.get()..(self.size + n).get();
         let generator: RowIndexGenerator<Schema> = RowIndexGenerator::new(range);
 
         self.size = self.size + n;
