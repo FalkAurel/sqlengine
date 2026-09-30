@@ -151,7 +151,7 @@ impl<M: RowMetadata> MutableRowStateChunk<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_engine::table::schema::Empty;
+    use crate::{storage_engine::table::schema::Empty, table::Node};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Debug)]
@@ -295,6 +295,17 @@ mod tests {
 
         assert!(start.next.get().is_none());
         assert_eq!(state.writer.current.as_usize(), 1);
+    }
+
+    #[test]
+    fn index_generation_over_multiple_chunks() {
+        let writer = RowState::<TestMetadata>::new();
+
+        let (_writer, generator) =  writer.insert_n::<Node<i32, Empty>>(CHUNK_SIZE + CHUNK_SIZE, Box::new( || metadata(1)));
+        
+        assert!(generator.zip(0..(CHUNK_SIZE + CHUNK_SIZE).as_usize()).all(|(index, exp)| -> bool {
+            index.offset == LogicalOffset::new(exp as u64)
+        }));
     }
 
     #[test]
