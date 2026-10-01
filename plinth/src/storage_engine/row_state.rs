@@ -46,7 +46,9 @@ impl<M: RowMetadata> RowState<M> {
         n: LogicalSize,
         f: impl Fn() -> M,
     ) -> (Self, impl Iterator<Item = RowIndex<'a, Schema>>) {
+        // One drawback of recursion :)
         let range: Range<u64> = self.size.get()..(self.size + n).get();
+        let end_offset: LogicalSize = self.size + n;
 
         match self.writer.insert_n(&f, n) {
             Ok(writer) => {
@@ -62,8 +64,7 @@ impl<M: RowMetadata> RowState<M> {
         }
 
         let generator: RowIndexGenerator<Schema> = RowIndexGenerator::new(range);
-
-        self.size = self.size + n;
+        self.size = end_offset;
 
         (self, generator)
     }
@@ -302,8 +303,9 @@ mod tests {
     fn index_generation_over_multiple_chunks() {
         let writer = RowState::<TestMetadata>::new();
 
-        let (_writer, generator) =  writer.insert_n::<Node<i32, Empty>>(CHUNK_SIZE + CHUNK_SIZE, Box::new( || metadata(1)));
-        
+        let (writer, generator) =  writer.insert_n::<Node<i32, Empty>>(CHUNK_SIZE + CHUNK_SIZE, Box::new( || metadata(1)));
+        assert_eq!(writer.size, CHUNK_SIZE + CHUNK_SIZE);
+
         assert!(generator.zip(0..(CHUNK_SIZE + CHUNK_SIZE).as_usize()).all(|(index, exp)| -> bool {
             index.offset == LogicalOffset::new(exp as u64)
         }));
