@@ -43,23 +43,24 @@ impl<M: RowMetadata> RowState<M> {
     /// in bulk rather than one call at a time.
     pub(crate) fn insert_n<'a, Schema: SchemaList + 'a>(
         mut self,
-        n: LogicalSize,
+        mut n: LogicalSize,
         f: impl Fn() -> M,
     ) -> (Self, impl Iterator<Item = RowIndex<'a, Schema>>) {
-        // One drawback of recursion :)
         let range: Range<u64> = self.size.get()..(self.size + n).get();
         let end_offset: LogicalSize = self.size + n;
 
-        match self.writer.insert_n(&f, n) {
-            Ok(writer) => {
-                self.writer = writer;
-            }
-            Err((chunk, remainder)) => {
-                self.writer = Default::default();
+        loop {
+            match self.writer.insert_n(&f, n) {
+                Ok(writer) => {
+                    self.writer = writer;
+                    break;
+                }
+                Err((chunk, remainder)) => {
+                    self.writer = Default::default();
 
-                self.freeze_chunk(chunk);
-                let (ret, _) = self.insert_n::<Schema>(remainder, f);
-                self = ret;
+                    self.freeze_chunk(chunk);
+                    n = remainder;
+                }
             }
         }
 
@@ -303,12 +304,15 @@ mod tests {
     fn index_generation_over_multiple_chunks() {
         let writer = RowState::<TestMetadata>::new();
 
-        let (writer, generator) =  writer.insert_n::<Node<i32, Empty>>(CHUNK_SIZE + CHUNK_SIZE, Box::new( || metadata(1)));
+        let (writer, generator) =
+            writer.insert_n::<Node<i32, Empty>>(CHUNK_SIZE + CHUNK_SIZE, Box::new(|| metadata(1)));
         assert_eq!(writer.size, CHUNK_SIZE + CHUNK_SIZE);
 
-        assert!(generator.zip(0..(CHUNK_SIZE + CHUNK_SIZE).as_usize()).all(|(index, exp)| -> bool {
-            index.offset == LogicalOffset::new(exp as u64)
-        }));
+        assert!(
+            generator
+                .zip(0..(CHUNK_SIZE + CHUNK_SIZE).as_usize())
+                .all(|(index, exp)| -> bool { index.offset == LogicalOffset::new(exp as u64) })
+        );
     }
 
     #[test]
