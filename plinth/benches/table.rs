@@ -74,7 +74,7 @@ fn benchmark_mass_api_insertion(c: &mut Criterion) {
                 b.iter_batched_ref(
                     || {
                         TableBuilder::default()
-                            .with_column::<i32>("ids")
+                            .with_column("ids")
                             .unwrap()
                             .with_column::<i64>("values")
                             .unwrap()
