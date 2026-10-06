@@ -35,9 +35,10 @@ cargo bench --features bench
 ## Development
 
 ```sh
-cargo test --all-features   # run all tests
-cargo clippy --all-targets  # lint
-cargo fmt                   # format
+cargo test --all-features        # run all tests
+cargo +nightly miri test         # run tests under Miri (UB / memory safety checks)
+cargo clippy --all-targets       # lint
+cargo fmt                        # format
 ```
 
 ## Releasing

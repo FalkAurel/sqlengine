@@ -3,7 +3,7 @@ use std::{marker::PhantomData, ops::Range};
 use crate::{table::schema::SchemaList, units::LogicalOffset};
 
 pub struct RowIndex<'table, Schema: SchemaList> {
-    offset: LogicalOffset,
+    pub(crate) offset: LogicalOffset,
     _marker: PhantomData<&'table Schema>,
 }
 

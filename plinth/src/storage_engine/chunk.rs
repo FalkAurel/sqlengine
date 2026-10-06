@@ -11,7 +11,10 @@ use crate::storage_engine::{
     vector::VectorIter,
 };
 
+#[cfg(not(miri))]
 pub(crate) const CHUNK_SIZE: LogicalSize = LogicalSize::new(1024 * 64);
+#[cfg(miri)]
+pub(crate) const CHUNK_SIZE: LogicalSize = LogicalSize::new(1024);
 
 #[derive(Debug)]
 pub(crate) struct FrozenChunk {
