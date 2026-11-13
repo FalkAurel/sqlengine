@@ -7,8 +7,6 @@ use arrow::{
 
 use crate::storage_engine::{chunk::CHUNK_SIZE, units::LogicalSize, vector::VectorIter};
 
-const PRE_ALLOCATION_SIZE: LogicalSize = LogicalSize::new(1024);
-
 /// Per-transaction staging buffer for a `MutableChunk`.
 ///
 /// Each `append_from_builder` call commits one transaction's rows as a frozen
@@ -47,7 +45,7 @@ pub(crate) struct CheckedBuilder<B: ArrayBuilder + ?Sized> {
 impl ChunkBuffer {
     pub(crate) fn new() -> Self {
         Self {
-            arrays: Vec::with_capacity(PRE_ALLOCATION_SIZE.as_usize()),
+            arrays: Vec::new(),
             size: LogicalSize::new(0),
             _marker: PhantomData,
         }
