@@ -2,12 +2,7 @@ use arrow::array::{Array, ArrayBuilder};
 use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
-    storage_engine::chunk::AppendableType,
-    storage_engine::{
-        chunk::{Append, ChunkWriter, FrozenChunk, MutableChunk},
-        units::VersionID,
-        writer_buffer::WriteBufferSnapshot,
-    },
+    storage_engine::{chunk::{Append, AppendableType, ChunkWriter, FrozenChunk, MutableChunk}, units::VersionID, writer_buffer::WriteBufferSnapshot}, writer_buffer::CheckedBuilder,
 };
 
 #[derive(Debug)]
@@ -165,19 +160,19 @@ impl Column {
     ///
     /// Returns `None` when the tail has temporarily been taken by a writer.
     pub(crate) fn read_mutable(&mut self) -> Option<WriteBufferSnapshot> {
-        let chunk = self.tail.take()?;
+        let chunk: MutableChunk = self.tail.take()?;
         let (builder, chunk_buffer, chunk_id) = chunk.into_parts();
 
         if builder.len() == 0 {
             // Nothing pending — return what is already committed.
-            let snap = chunk_buffer.snapshot();
+            let snap: WriteBufferSnapshot = chunk_buffer.snapshot();
             self.tail = Some(MutableChunk::from_raw(builder, chunk_buffer, chunk_id));
             return Some(snap);
         }
 
         // Flush pending rows to a single Arc — zero-copy (finish() transfers the
         // builder's Vec<T> into an Arrow Buffer without copying).
-        let checked = match chunk_buffer.make_builder(builder) {
+        let checked: CheckedBuilder<dyn ArrayBuilder> = match chunk_buffer.make_builder(builder) {
             Ok(c) => c,
             Err(_) => unreachable!(
                 "pending builder rows always fit: write() enforces the capacity invariant"
@@ -186,7 +181,7 @@ impl Column {
 
         match chunk_buffer.append_from_builder(checked) {
             Ok((new_buffer, new_builder)) => {
-                let snap = new_buffer.snapshot();
+                let snap: WriteBufferSnapshot = new_buffer.snapshot();
                 self.tail = Some(MutableChunk::from_raw(new_builder, new_buffer, chunk_id));
                 Some(snap)
             }
