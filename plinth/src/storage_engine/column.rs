@@ -2,7 +2,12 @@ use arrow::array::{Array, ArrayBuilder};
 use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
-    storage_engine::{chunk::{Append, AppendableType, ChunkWriter, FrozenChunk, MutableChunk}, units::VersionID, writer_buffer::WriteBufferSnapshot}, writer_buffer::CheckedBuilder,
+    storage_engine::{
+        chunk::{Append, AppendableType, ChunkWriter, FrozenChunk, MutableChunk},
+        units::VersionID,
+        writer_buffer::WriteBufferSnapshot,
+    },
+    writer_buffer::{CheckedBuilder, Full, Partial},
 };
 
 #[derive(Debug)]
@@ -58,22 +63,19 @@ impl Column {
                 Err((builder, chunk_buffer, chunk_id)) => {
                     // The builder plus previously committed arrays exactly fill CHUNK_SIZE.
                     // Flush the full builder into the buffer and fuse into a frozen array.
-                    let checked = chunk_buffer
-                        .make_builder(builder)
-                        .expect("full builder must fit: chunk_buffer.size + builder.len == CHUNK_SIZE");
-                    let (new_builder, fused) = match chunk_buffer
-                        .append_from_builder(checked)
-                    {
+                    let checked: CheckedBuilder<<V as AppendableType>::Builder> =
+                        chunk_buffer.make_builder(builder).expect(
+                            "full builder must fit: chunk_buffer.size + builder.len == CHUNK_SIZE",
+                        );
+                    let Full { builder, array } = match chunk_buffer.append_from_builder(checked) {
                         Err(values) => values,
                         Ok(_) => unreachable!(
                             "chunk_buffer.size + builder.len == CHUNK_SIZE, so append_from_builder must fuse"
                         ),
                     };
-                    self.publish_frozen_chunk(fused, chunk_id);
+                    self.publish_frozen_chunk(array, chunk_id);
 
-                    match MutableChunk::new(new_builder, (self.next_version)())
-                        .get_writer::<V>()
-                    {
+                    match MutableChunk::new(builder, (self.next_version)()).get_writer::<V>() {
                         Ok(res) => writer = res,
                         Err(_) => unreachable!(
                             "builder type invariant violated: newly created builder must resolve"
@@ -114,24 +116,20 @@ impl Column {
                     break;
                 }
                 Err((builder, chunk_buffer, chunk_id, remainder)) => {
-                    let checked = chunk_buffer
-                        .make_builder(builder)
-                        .expect("full builder must fit: chunk_buffer.size + builder.len == CHUNK_SIZE");
-                    let (new_builder, fused) = match chunk_buffer
-                        .append_from_builder(checked)
-                    {
+                    let checked = chunk_buffer.make_builder(builder).expect(
+                        "full builder must fit: chunk_buffer.size + builder.len == CHUNK_SIZE",
+                    );
+                    let Full { builder, array } = match chunk_buffer.append_from_builder(checked) {
                         Err(values) => values,
                         Ok(_) => unreachable!(
                             "chunk_buffer.size + builder.len == CHUNK_SIZE, so append_from_builder must fuse"
                         ),
                     };
-                    self.publish_frozen_chunk(fused, chunk_id);
+                    self.publish_frozen_chunk(array, chunk_id);
 
                     values = remainder;
 
-                    match MutableChunk::new(new_builder, (self.next_version)())
-                        .get_writer::<B>()
-                    {
+                    match MutableChunk::new(builder, (self.next_version)()).get_writer::<B>() {
                         Ok(res) => writer = res,
                         Err(_) => unreachable!(
                             "builder type invariant violated: newly created builder must resolve"
@@ -163,7 +161,7 @@ impl Column {
         let chunk: MutableChunk = self.tail.take()?;
         let (builder, chunk_buffer, chunk_id) = chunk.into_parts();
 
-        if builder.len() == 0 {
+        if builder.is_empty() {
             // Nothing pending — return what is already committed.
             let snap: WriteBufferSnapshot = chunk_buffer.snapshot();
             self.tail = Some(MutableChunk::from_raw(builder, chunk_buffer, chunk_id));
@@ -180,15 +178,15 @@ impl Column {
         };
 
         match chunk_buffer.append_from_builder(checked) {
-            Ok((new_buffer, new_builder)) => {
-                let snap: WriteBufferSnapshot = new_buffer.snapshot();
-                self.tail = Some(MutableChunk::from_raw(new_builder, new_buffer, chunk_id));
+            Ok(Partial { builder, buffer }) => {
+                let snap: WriteBufferSnapshot = buffer.snapshot();
+                self.tail = Some(MutableChunk::from_raw(builder, buffer, chunk_id));
                 Some(snap)
             }
-            Err((new_builder, fused)) => {
+            Err(Full { builder, array }) => {
                 // Pending rows exactly filled the chunk — publish and start a new tail.
-                self.publish_frozen_chunk(fused, chunk_id);
-                self.tail = Some(MutableChunk::new(new_builder, (self.next_version)()));
+                self.publish_frozen_chunk(array, chunk_id);
+                self.tail = Some(MutableChunk::new(builder, (self.next_version)()));
                 Some(self.tail.as_ref().unwrap().snapshot())
             }
         }

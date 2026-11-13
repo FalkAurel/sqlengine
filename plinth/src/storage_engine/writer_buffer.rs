@@ -42,6 +42,16 @@ pub(crate) struct CheckedBuilder<B: ArrayBuilder + ?Sized> {
     pub(crate) builder: Box<B>,
 }
 
+pub(crate) struct Partial<B: ArrayBuilder + ?Sized> {
+    pub(crate) buffer: ChunkBuffer,
+    pub(crate) builder: Box<B>,
+}
+
+pub(crate) struct Full<B: ArrayBuilder + ?Sized> {
+    pub(crate) builder: Box<B>,
+    pub(crate) array: Arc<dyn Array>,
+}
+
 impl ChunkBuffer {
     pub(crate) fn new() -> Self {
         Self {
@@ -73,14 +83,13 @@ impl ChunkBuffer {
 
     /// Commit `builder`'s current rows as a frozen snapshot.
     ///
-    /// Returns `Ok((Self, Box<B>))` when the chunk is not yet full (the builder
-    /// is reset and returned for reuse). Returns `Err((Box<B>, Arc<dyn Array>))`
-    /// when the chunk is exactly full — the fused frozen array is ready to
-    /// publish.
+    /// Returns `Ok(Partial)` when the chunk is not yet full (the builder
+    /// is reset and returned for reuse). Returns `Err(Full)` when the chunk
+    /// is exactly full — the fused frozen array is ready to publish.
     pub(crate) fn append_from_builder<B: ArrayBuilder + ?Sized>(
         mut self,
         mut builder: CheckedBuilder<B>,
-    ) -> Result<(Self, Box<B>), (Box<B>, Arc<dyn Array>)> {
+    ) -> Result<Partial<B>, Full<B>> {
         self.size = self.size + LogicalSize::new(builder.builder.len() as u64);
 
         let array: Arc<dyn Array> = builder.builder.finish();
@@ -88,9 +97,15 @@ impl ChunkBuffer {
 
         if self.size == LogicalSize::new(CHUNK_SIZE.get()) {
             let fused: Arc<dyn Array> = self.fuse_arrays();
-            Err((builder.builder, fused))
+            Err(Full {
+                builder: builder.builder,
+                array: fused,
+            })
         } else {
-            Ok((self, builder.builder))
+            Ok(Partial {
+                buffer: self,
+                builder: builder.builder,
+            })
         }
     }
 
@@ -110,7 +125,8 @@ impl ChunkBuffer {
             return self.arrays[0].clone();
         }
         let refs: Vec<&dyn Array> = self.arrays.iter().map(|a| a.as_ref()).collect();
-        concat(&refs).expect("fuse_arrays called with homogeneous arrays from the same builder type")
+        concat(&refs)
+            .expect("fuse_arrays called with homogeneous arrays from the same builder type")
     }
 }
 
@@ -141,22 +157,20 @@ impl WriteBufferSnapshot {
     /// Arrays that don't downcast to `A` are silently skipped (this should not
     /// happen in practice because all arrays in a chunk come from the same builder).
     pub(crate) fn vectors<A: Array + 'static>(&self) -> impl Iterator<Item = VectorIter<'_, A>> {
-        self.0.iter().filter_map(|arc| {
-            arc.as_any()
-                .downcast_ref::<A>()
-                .map(VectorIter::new)
-        })
+        self.0
+            .iter()
+            .filter_map(|arc| arc.as_any().downcast_ref::<A>().map(VectorIter::new))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use arrow::{
-        array::{PrimitiveBuilder},
-        datatypes::UInt64Type,
-    };
+    use arrow::{array::PrimitiveBuilder, datatypes::UInt64Type};
 
-    use crate::storage_engine::{chunk::CHUNK_SIZE, writer_buffer::ChunkBuffer};
+    use crate::{
+        storage_engine::{chunk::CHUNK_SIZE, writer_buffer::ChunkBuffer},
+        writer_buffer::Partial,
+    };
 
     #[test]
     fn empty_buffer() {
@@ -188,8 +202,11 @@ mod tests {
             Ok(c) => c,
             Err(_) => panic!("single-element builder must fit"),
         };
-        let (b, mut reused) = match buffer.append_from_builder(checked) {
-            Ok(pair) => pair,
+        let Partial {
+            buffer: b,
+            builder: mut reused,
+        } = match buffer.append_from_builder(checked) {
+            Ok(partial) => partial,
             Err(_) => panic!("one element must not fill the chunk"),
         };
         buffer = b;
@@ -228,8 +245,8 @@ mod tests {
             Ok(c) => c,
             Err(_) => panic!("single-element builder must fit"),
         };
-        let (b, _) = match buffer.append_from_builder(checked) {
-            Ok(pair) => pair,
+        let Partial { buffer: b, .. } = match buffer.append_from_builder(checked) {
+            Ok(partial) => partial,
             Err(_) => panic!("one element must not fill the chunk"),
         };
         buffer = b;

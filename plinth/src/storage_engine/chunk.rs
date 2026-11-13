@@ -142,8 +142,7 @@ impl MutableChunk {
     /// Decompose into raw parts for type-erased flush (e.g. in `Column::read_mutable`).
     pub(crate) fn into_parts(self) -> (Box<dyn ArrayBuilder>, ChunkBuffer, VersionID) {
         (
-            self.builder
-                .expect("MutableChunk builder must be present"),
+            self.builder.expect("MutableChunk builder must be present"),
             self.chunk_buffer
                 .expect("MutableChunk chunk_buffer must be present"),
             self.chunk_id,
@@ -495,10 +494,11 @@ mod test {
                 .expect("chunk should have capacity");
         }
 
-        let (builder, _chunk_buffer, version_id) = match writer.append((CHUNK_SIZE.get() - 1) as i64) {
-            Ok(_) => panic!("the final value should complete the chunk"),
-            Err(values) => values,
-        };
+        let (builder, _chunk_buffer, version_id) =
+            match writer.append((CHUNK_SIZE.get() - 1) as i64) {
+                Ok(_) => panic!("the final value should complete the chunk"),
+                Err(values) => values,
+            };
 
         assert_eq!(version_id, VersionID::new(42));
         assert_eq!(builder.len(), CHUNK_SIZE.get() as usize);
@@ -673,10 +673,11 @@ mod test {
             chunk_writer = chunk_writer.append(value as i64).unwrap();
         }
 
-        let (mut builder, _chunk_buffer, version_id) = match chunk_writer.append(CHUNK_SIZE.get() as i64 - 1) {
-            Ok(_) => panic!("final append should freeze the chunk"),
-            Err(values) => values,
-        };
+        let (mut builder, _chunk_buffer, version_id) =
+            match chunk_writer.append(CHUNK_SIZE.get() as i64 - 1) {
+                Ok(_) => panic!("final append should freeze the chunk"),
+                Err(values) => values,
+            };
         let array: Arc<dyn Array + 'static> = Arc::new(builder.finish());
         let frozen_chunk = FrozenChunk::new(array, version_id);
 
@@ -733,10 +734,11 @@ mod test {
         let writer = unwrap_builder::<i64>(mutable_chunk);
 
         let values: Vec<i64> = (0..CHUNK_SIZE.get() as i64).collect();
-        let (finished_builder, _chunk_buffer, version_id, remainder) = match writer.append_values(&values) {
-            Err(tuple) => tuple,
-            Ok(_) => panic!("exact fill must return Err with empty remainder"),
-        };
+        let (finished_builder, _chunk_buffer, version_id, remainder) =
+            match writer.append_values(&values) {
+                Err(tuple) => tuple,
+                Ok(_) => panic!("exact fill must return Err with empty remainder"),
+            };
 
         assert_eq!(version_id, VersionID::new(7));
         assert_eq!(finished_builder.len(), CHUNK_SIZE.get() as usize);
@@ -751,10 +753,11 @@ mod test {
 
         let overflow = 5usize;
         let values: Vec<i64> = (0..CHUNK_SIZE.get() as i64 + overflow as i64).collect();
-        let (finished_builder, _chunk_buffer, version_id, remaining) = match writer.append_values(&values) {
-            Err(tuple) => tuple,
-            Ok(_) => panic!("overflow must return Err with the remaining slice"),
-        };
+        let (finished_builder, _chunk_buffer, version_id, remaining) =
+            match writer.append_values(&values) {
+                Err(tuple) => tuple,
+                Ok(_) => panic!("overflow must return Err with the remaining slice"),
+            };
 
         assert_eq!(version_id, VersionID::new(3));
         assert_eq!(finished_builder.len(), CHUNK_SIZE.get() as usize);
@@ -776,10 +779,11 @@ mod test {
         let overflow = 3usize;
         let remaining_capacity = CHUNK_SIZE.get() as usize - pre_filled;
         let values: Vec<i64> = (0..remaining_capacity as i64 + overflow as i64).collect();
-        let (finished_builder, _chunk_buffer, version_id, remaining) = match writer.append_values(&values) {
-            Err(tuple) => tuple,
-            Ok(_) => panic!("overflow must return Err"),
-        };
+        let (finished_builder, _chunk_buffer, version_id, remaining) =
+            match writer.append_values(&values) {
+                Err(tuple) => tuple,
+                Ok(_) => panic!("overflow must return Err"),
+            };
 
         assert_eq!(version_id, VersionID::new(5));
         assert_eq!(finished_builder.len(), CHUNK_SIZE.get() as usize);
@@ -824,10 +828,11 @@ mod test {
             writer = writer.append(value as i64).unwrap();
         }
 
-        let (mut builder, _chunk_buffer, version_id) = match writer.append((CHUNK_SIZE.get() - 1) as i64) {
-            Ok(_) => panic!("final append should complete the chunk"),
-            Err(values) => values,
-        };
+        let (mut builder, _chunk_buffer, version_id) =
+            match writer.append((CHUNK_SIZE.get() - 1) as i64) {
+                Ok(_) => panic!("final append should complete the chunk"),
+                Err(values) => values,
+            };
 
         let array: Arc<dyn Array> = Arc::new(builder.finish());
         let frozen = FrozenChunk::new(array, version_id);
