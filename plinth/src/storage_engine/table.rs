@@ -291,7 +291,7 @@ pub trait TableRow {
                 .expect("Terminating Program: Datastorage has been corrupted. Verify if your index mapping is actually mapping to the right column type.")
         }
 
-        let metadata = table
+        let metadata: RowState<M> = table
             .metadata
             .take()
             .expect("Table is in invalid state. Either concurrent writes are happening or TableBuilder failed");

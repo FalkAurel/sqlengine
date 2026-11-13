@@ -5,6 +5,7 @@ pub(crate) mod row_state;
 pub mod table;
 pub mod units;
 pub(crate) mod vector;
+pub(crate) mod writer_buffer;
 
 pub use chunk::{Append, AppendableType};
 pub use row_state::RowMetadata;

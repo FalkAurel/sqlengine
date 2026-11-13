@@ -9,6 +9,7 @@ use arrow::array::{Array, ArrayBuilder};
 use crate::storage_engine::{
     units::{LogicalSize, VersionID},
     vector::VectorIter,
+    writer_buffer::{ChunkBuffer, WriteBufferSnapshot},
 };
 
 #[cfg(not(miri))]
@@ -86,25 +87,27 @@ impl<'a, A: Array> ChunkView<'a, A> {
 
 pub(crate) struct MutableChunk {
     builder: Option<Box<dyn ArrayBuilder>>,
+    chunk_buffer: Option<ChunkBuffer>,
     chunk_id: VersionID,
 }
 
 impl MutableChunk {
-    pub(crate) const fn new(builder: Box<dyn ArrayBuilder>, chunk_id: VersionID) -> Self {
+    pub(crate) fn new(builder: Box<dyn ArrayBuilder>, chunk_id: VersionID) -> Self {
         Self {
             builder: Some(builder),
+            chunk_buffer: Some(ChunkBuffer::new()),
             chunk_id,
         }
     }
 
-    pub(crate) fn get_snapshot(&self) -> Arc<dyn Array> {
-        self.builder
+    pub(crate) fn snapshot(&self) -> WriteBufferSnapshot {
+        self.chunk_buffer
             .as_ref()
             .expect("Invalid State. Make sure to not have an active ChunkWriter.")
-            .finish_cloned()
+            .snapshot()
     }
 
-    pub(crate) fn builder<B: AppendableType>(mut self) -> Result<ChunkWriter<B>, Self> {
+    pub(crate) fn get_writer<B: AppendableType>(mut self) -> Result<ChunkWriter<B>, Self> {
         let builder: &dyn ArrayBuilder = self
             .builder
             .as_deref()
@@ -121,8 +124,14 @@ impl MutableChunk {
                 .downcast::<B::Builder>()
                 .expect("builder type must match the type checked above");
 
+            let chunk_buffer = self
+                .chunk_buffer
+                .take()
+                .expect("MutableChunk chunk_buffer must be present before ChunkWriter creation");
+
             Ok(ChunkWriter {
                 builder,
+                chunk_buffer,
                 chunk_id: self.chunk_id,
             })
         } else {
@@ -130,16 +139,45 @@ impl MutableChunk {
         }
     }
 
+    /// Decompose into raw parts for type-erased flush (e.g. in `Column::read_mutable`).
+    pub(crate) fn into_parts(self) -> (Box<dyn ArrayBuilder>, ChunkBuffer, VersionID) {
+        (
+            self.builder.expect("MutableChunk builder must be present"),
+            self.chunk_buffer
+                .expect("MutableChunk chunk_buffer must be present"),
+            self.chunk_id,
+        )
+    }
+
     pub(crate) fn from<B: AppendableType>(writer: ChunkWriter<B>) -> Self {
         Self {
             builder: Some(writer.builder),
+            chunk_buffer: Some(writer.chunk_buffer),
             chunk_id: writer.chunk_id,
+        }
+    }
+
+    /// Reconstruct a `MutableChunk` from raw parts after a flush.
+    ///
+    /// Used by `column.rs` after calling `ChunkBuffer::append_from_builder` to
+    /// store the updated buffer and reset builder back without going through the
+    /// typed `ChunkWriter` round-trip.
+    pub(crate) fn from_raw(
+        builder: Box<dyn ArrayBuilder>,
+        chunk_buffer: ChunkBuffer,
+        chunk_id: VersionID,
+    ) -> Self {
+        Self {
+            builder: Some(builder),
+            chunk_buffer: Some(chunk_buffer),
+            chunk_id,
         }
     }
 }
 
 pub(crate) struct ChunkWriter<B: AppendableType> {
     builder: Box<B::Builder>,
+    chunk_buffer: ChunkBuffer,
     chunk_id: VersionID,
 }
 
@@ -165,17 +203,17 @@ impl<B: AppendableType> ChunkWriter<B> {
     pub(crate) fn append(
         mut self,
         value: <<B as AppendableType>::Builder as Append<B>>::Element,
-    ) -> Result<Self, (Box<B::Builder>, VersionID)> {
+    ) -> Result<Self, (Box<B::Builder>, ChunkBuffer, VersionID)> {
         debug_assert!(
-            self.builder.len() < CHUNK_SIZE.get() as usize,
+            self.builder.len() + self.chunk_buffer.size().as_usize() < CHUNK_SIZE.get() as usize,
             "State Machine should never enter a state where we have a full buffer but keep writing to it."
         );
         self.builder.append(value);
 
-        if self.builder.len() < CHUNK_SIZE.get() as usize {
+        if self.builder.len() + self.chunk_buffer.size().as_usize() < CHUNK_SIZE.get() as usize {
             Ok(self)
         } else {
-            Err((self.builder, self.chunk_id))
+            Err((self.builder, self.chunk_buffer, self.chunk_id))
         }
     }
 
@@ -188,24 +226,31 @@ impl<B: AppendableType> ChunkWriter<B> {
         Self,
         (
             Box<B::Builder>,
+            ChunkBuffer,
             VersionID,
             &[<<B as AppendableType>::Builder as Append<B>>::Element],
         ),
     > {
         debug_assert!(
-            self.builder.len() < CHUNK_SIZE.get() as usize,
+            self.builder.len() + self.chunk_buffer.size().as_usize() < CHUNK_SIZE.get() as usize,
             "State Machine should never enter a state where we have a full buffer but keep writing to it."
         );
 
-        let capacity: usize = CHUNK_SIZE.get() as usize - self.builder.len();
+        let capacity: usize =
+            CHUNK_SIZE.get() as usize - self.builder.len() - self.chunk_buffer.size().as_usize();
         let (written, returnable) = values.split_at(values.len().min(capacity));
         self.builder.append_values(written);
 
-        if self.builder.len() == CHUNK_SIZE.get() as usize {
-            Err((self.builder, self.chunk_id, returnable))
+        if self.builder.len() + self.chunk_buffer.size().as_usize() == CHUNK_SIZE.get() as usize {
+            Err((self.builder, self.chunk_buffer, self.chunk_id, returnable))
         } else {
             Ok(self)
         }
+    }
+
+    /// Decompose the writer into its constituent parts for end-of-transaction flush.
+    pub(crate) fn into_parts(self) -> (Box<B::Builder>, ChunkBuffer, VersionID) {
+        (self.builder, self.chunk_buffer, self.chunk_id)
     }
 }
 
@@ -401,7 +446,7 @@ mod test {
     };
 
     fn unwrap_builder<V: AppendableType>(chunk: MutableChunk) -> ChunkWriter<V> {
-        match chunk.builder::<V>() {
+        match chunk.get_writer::<V>() {
             Ok(writer) => writer,
             Err(_) => panic!("builder type resolution failed"),
         }
@@ -427,7 +472,7 @@ mod test {
             "the append filling the chunk must return the completed builder"
         );
 
-        let (builder, version_id) = match result {
+        let (builder, _chunk_buffer, version_id) = match result {
             Err(values) => values,
             Ok(_) => panic!("State Machine in invalid state"),
         };
@@ -449,10 +494,11 @@ mod test {
                 .expect("chunk should have capacity");
         }
 
-        let (builder, version_id) = match writer.append((CHUNK_SIZE.get() - 1) as i64) {
-            Ok(_) => panic!("the final value should complete the chunk"),
-            Err(values) => values,
-        };
+        let (builder, _chunk_buffer, version_id) =
+            match writer.append((CHUNK_SIZE.get() - 1) as i64) {
+                Ok(_) => panic!("the final value should complete the chunk"),
+                Err(values) => values,
+            };
 
         assert_eq!(version_id, VersionID::new(42));
         assert_eq!(builder.len(), CHUNK_SIZE.get() as usize);
@@ -473,7 +519,7 @@ mod test {
         let builder: Box<dyn ArrayBuilder> = Box::new(i64::builder());
         let mutable_chunk = MutableChunk::new(builder, VersionID::new(7));
 
-        let result = mutable_chunk.builder::<f32>();
+        let result = mutable_chunk.get_writer::<f32>();
 
         assert!(
             result.is_err(),
@@ -627,10 +673,11 @@ mod test {
             chunk_writer = chunk_writer.append(value as i64).unwrap();
         }
 
-        let (mut builder, version_id) = match chunk_writer.append(CHUNK_SIZE.get() as i64 - 1) {
-            Ok(_) => panic!("final append should freeze the chunk"),
-            Err(values) => values,
-        };
+        let (mut builder, _chunk_buffer, version_id) =
+            match chunk_writer.append(CHUNK_SIZE.get() as i64 - 1) {
+                Ok(_) => panic!("final append should freeze the chunk"),
+                Err(values) => values,
+            };
         let array: Arc<dyn Array + 'static> = Arc::new(builder.finish());
         let frozen_chunk = FrozenChunk::new(array, version_id);
 
@@ -687,10 +734,11 @@ mod test {
         let writer = unwrap_builder::<i64>(mutable_chunk);
 
         let values: Vec<i64> = (0..CHUNK_SIZE.get() as i64).collect();
-        let (finished_builder, version_id, remainder) = match writer.append_values(&values) {
-            Err(tuple) => tuple,
-            Ok(_) => panic!("exact fill must return Err with empty remainder"),
-        };
+        let (finished_builder, _chunk_buffer, version_id, remainder) =
+            match writer.append_values(&values) {
+                Err(tuple) => tuple,
+                Ok(_) => panic!("exact fill must return Err with empty remainder"),
+            };
 
         assert_eq!(version_id, VersionID::new(7));
         assert_eq!(finished_builder.len(), CHUNK_SIZE.get() as usize);
@@ -705,10 +753,11 @@ mod test {
 
         let overflow = 5usize;
         let values: Vec<i64> = (0..CHUNK_SIZE.get() as i64 + overflow as i64).collect();
-        let (finished_builder, version_id, remaining) = match writer.append_values(&values) {
-            Err(tuple) => tuple,
-            Ok(_) => panic!("overflow must return Err with the remaining slice"),
-        };
+        let (finished_builder, _chunk_buffer, version_id, remaining) =
+            match writer.append_values(&values) {
+                Err(tuple) => tuple,
+                Ok(_) => panic!("overflow must return Err with the remaining slice"),
+            };
 
         assert_eq!(version_id, VersionID::new(3));
         assert_eq!(finished_builder.len(), CHUNK_SIZE.get() as usize);
@@ -730,10 +779,11 @@ mod test {
         let overflow = 3usize;
         let remaining_capacity = CHUNK_SIZE.get() as usize - pre_filled;
         let values: Vec<i64> = (0..remaining_capacity as i64 + overflow as i64).collect();
-        let (finished_builder, version_id, remaining) = match writer.append_values(&values) {
-            Err(tuple) => tuple,
-            Ok(_) => panic!("overflow must return Err"),
-        };
+        let (finished_builder, _chunk_buffer, version_id, remaining) =
+            match writer.append_values(&values) {
+                Err(tuple) => tuple,
+                Ok(_) => panic!("overflow must return Err"),
+            };
 
         assert_eq!(version_id, VersionID::new(5));
         assert_eq!(finished_builder.len(), CHUNK_SIZE.get() as usize);
@@ -778,10 +828,11 @@ mod test {
             writer = writer.append(value as i64).unwrap();
         }
 
-        let (mut builder, version_id) = match writer.append((CHUNK_SIZE.get() - 1) as i64) {
-            Ok(_) => panic!("final append should complete the chunk"),
-            Err(values) => values,
-        };
+        let (mut builder, _chunk_buffer, version_id) =
+            match writer.append((CHUNK_SIZE.get() - 1) as i64) {
+                Ok(_) => panic!("final append should complete the chunk"),
+                Err(values) => values,
+            };
 
         let array: Arc<dyn Array> = Arc::new(builder.finish());
         let frozen = FrozenChunk::new(array, version_id);

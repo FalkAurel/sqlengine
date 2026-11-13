@@ -2,11 +2,12 @@ use arrow::array::{Array, ArrayBuilder};
 use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
-    storage_engine::chunk::AppendableType,
     storage_engine::{
-        chunk::{Append, ChunkWriter, FrozenChunk, MutableChunk},
+        chunk::{Append, AppendableType, ChunkWriter, FrozenChunk, MutableChunk},
         units::VersionID,
+        writer_buffer::WriteBufferSnapshot,
     },
+    writer_buffer::{CheckedBuilder, Full, Partial},
 };
 
 #[derive(Debug)]
@@ -44,7 +45,7 @@ impl Column {
             .tail
             .take()
             .expect("Impossible to fail since we manually set a MutableChunks")
-            .builder()
+            .get_writer::<V>()
         {
             Ok(res) => res,
             Err(err) => {
@@ -55,25 +56,39 @@ impl Column {
 
         for value in values {
             match writer.append(value) {
-                Ok(new_builder) => {
-                    writer = new_builder;
+                Ok(new_writer) => {
+                    writer = new_writer;
                 }
 
-                Err((mut previous_builder, chunk_id)) => {
-                    let array: Arc<dyn Array> = previous_builder.finish(); // Resets the builder
+                Err((builder, chunk_buffer, chunk_id)) => {
+                    // The builder plus previously committed arrays exactly fill CHUNK_SIZE.
+                    // Flush the full builder into the buffer and fuse into a frozen array.
+                    let checked: CheckedBuilder<<V as AppendableType>::Builder> =
+                        chunk_buffer.make_builder(builder).expect(
+                            "full builder must fit: chunk_buffer.size + builder.len == CHUNK_SIZE",
+                        );
+                    let Full { builder, array } = match chunk_buffer.append_from_builder(checked) {
+                        Err(values) => values,
+                        Ok(_) => unreachable!(
+                            "chunk_buffer.size + builder.len == CHUNK_SIZE, so append_from_builder must fuse"
+                        ),
+                    };
                     self.publish_frozen_chunk(array, chunk_id);
 
-                    match MutableChunk::new(previous_builder, (self.next_version)()).builder() {
+                    match MutableChunk::new(builder, (self.next_version)()).get_writer::<V>() {
                         Ok(res) => writer = res,
                         Err(_) => unreachable!(
-                            "builder type invariant violated: ChunkWriter returned a builder that MutableChunk could not recover"
+                            "builder type invariant violated: newly created builder must resolve"
                         ),
                     }
                 }
             }
         }
 
-        self.tail = Some(MutableChunk::from(writer));
+        // Lazy flush — rows stay in the builder until a snapshot is requested.
+        let (builder, chunk_buffer, chunk_id) = writer.into_parts();
+        self.tail = Some(MutableChunk::from_raw(builder, chunk_buffer, chunk_id));
+
         Ok(())
     }
 
@@ -85,7 +100,7 @@ impl Column {
             .tail
             .take()
             .expect("Impossible to fail since we manually set a MutableChunks")
-            .builder()
+            .get_writer::<B>()
         {
             Ok(res) => res,
             Err(err) => {
@@ -96,27 +111,38 @@ impl Column {
 
         while !values.is_empty() {
             match writer.append_values(values) {
-                Ok(new_builder) => {
-                    writer = new_builder;
+                Ok(new_writer) => {
+                    writer = new_writer;
                     break;
                 }
-                Err((mut builder, chunk_id, remainder)) => {
-                    let array: Arc<dyn Array> = builder.finish();
+                Err((builder, chunk_buffer, chunk_id, remainder)) => {
+                    let checked = chunk_buffer.make_builder(builder).expect(
+                        "full builder must fit: chunk_buffer.size + builder.len == CHUNK_SIZE",
+                    );
+                    let Full { builder, array } = match chunk_buffer.append_from_builder(checked) {
+                        Err(values) => values,
+                        Ok(_) => unreachable!(
+                            "chunk_buffer.size + builder.len == CHUNK_SIZE, so append_from_builder must fuse"
+                        ),
+                    };
                     self.publish_frozen_chunk(array, chunk_id);
 
                     values = remainder;
 
-                    match MutableChunk::new(builder, (self.next_version)()).builder() {
+                    match MutableChunk::new(builder, (self.next_version)()).get_writer::<B>() {
                         Ok(res) => writer = res,
                         Err(_) => unreachable!(
-                            "builder type invariant violated: ChunkWriter returned a builder that MutableChunk could not recover"
+                            "builder type invariant violated: newly created builder must resolve"
                         ),
                     }
                 }
             }
         }
 
-        self.tail = Some(MutableChunk::from(writer));
+        // Lazy flush — rows stay in the builder until a snapshot is requested.
+        let (builder, chunk_buffer, chunk_id) = writer.into_parts();
+        self.tail = Some(MutableChunk::from_raw(builder, chunk_buffer, chunk_id));
+
         Ok(())
     }
 
@@ -125,16 +151,45 @@ impl Column {
         self.head.clone()
     }
 
-    /// Returns a snapshot of the mutable tail if it is currently owned by the
-    /// column. `None` indicates that the tail has temporarily been taken by a
-    /// writer.
+    /// Returns a zero-copy snapshot of the committed rows in the mutable write
+    /// buffer. Pending rows that have accumulated in the builder since the last
+    /// snapshot are flushed to a single `Arc<dyn Array>` (zero-copy `finish()`)
+    /// before the snapshot is taken, so the caller always sees up-to-date state.
     ///
-    /// Callers are expected to synchronize access externally (e.g. via MVCC).
-    /// However, even if external synchronization is not upheld, this method
-    /// prevents inconsistent reads by returning `None` while the tail is
-    /// temporarily unavailable.
-    pub(crate) fn read_mutable(&self) -> Option<Arc<dyn Array>> {
-        self.tail.as_ref().map(|inner| inner.get_snapshot())
+    /// Returns `None` when the tail has temporarily been taken by a writer.
+    pub(crate) fn read_mutable(&mut self) -> Option<WriteBufferSnapshot> {
+        let chunk: MutableChunk = self.tail.take()?;
+        let (builder, chunk_buffer, chunk_id) = chunk.into_parts();
+
+        if builder.is_empty() {
+            // Nothing pending — return what is already committed.
+            let snap: WriteBufferSnapshot = chunk_buffer.snapshot();
+            self.tail = Some(MutableChunk::from_raw(builder, chunk_buffer, chunk_id));
+            return Some(snap);
+        }
+
+        // Flush pending rows to a single Arc — zero-copy (finish() transfers the
+        // builder's Vec<T> into an Arrow Buffer without copying).
+        let checked: CheckedBuilder<dyn ArrayBuilder> = match chunk_buffer.make_builder(builder) {
+            Ok(c) => c,
+            Err(_) => unreachable!(
+                "pending builder rows always fit: write() enforces the capacity invariant"
+            ),
+        };
+
+        match chunk_buffer.append_from_builder(checked) {
+            Ok(Partial { builder, buffer }) => {
+                let snap: WriteBufferSnapshot = buffer.snapshot();
+                self.tail = Some(MutableChunk::from_raw(builder, buffer, chunk_id));
+                Some(snap)
+            }
+            Err(Full { builder, array }) => {
+                // Pending rows exactly filled the chunk — publish and start a new tail.
+                self.publish_frozen_chunk(array, chunk_id);
+                self.tail = Some(MutableChunk::new(builder, (self.next_version)()));
+                Some(self.tail.as_ref().unwrap().snapshot())
+            }
+        }
     }
 
     fn publish_frozen_chunk(&mut self, array: Arc<dyn Array>, chunk_id: VersionID) {
@@ -179,7 +234,7 @@ mod tests {
 
     #[test]
     fn new_column_has_mutable_tail() {
-        let column = Column::new(version_generator(), i64::builder());
+        let mut column = Column::new(version_generator(), i64::builder());
 
         assert!(column.read_frozen().is_none());
 
@@ -200,11 +255,15 @@ mod tests {
 
         let snapshot = column.read_mutable().expect("mutable tail should exist");
 
-        let array = snapshot
+        // Each write() commits exactly one Arc into the buffer.
+        let mut arrays = snapshot.iter();
+        let array = arrays
+            .next()
+            .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("snapshot should be an Int64Array");
-
+        assert!(arrays.next().is_none());
         assert_eq!(array.values(), &[10, 20, 30]);
     }
 
@@ -213,19 +272,39 @@ mod tests {
         let mut column = Column::new(version_generator(), i64::builder());
 
         column.write::<i64>([10, 20, 30].into_iter()).unwrap();
-
         let first = column.read_mutable().expect("mutable tail should exist");
 
         column.write::<i64>([40, 50].into_iter()).unwrap();
-
         let second = column.read_mutable().expect("mutable tail should exist");
 
-        let first = first.as_any().downcast_ref::<Int64Array>().unwrap();
+        // first snapshot was taken after one write: one array [10, 20, 30]
+        let mut first_iter = first.iter();
+        let first_array = first_iter
+            .next()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(first_iter.next().is_none());
+        assert_eq!(first_array.values(), &[10, 20, 30]);
 
-        let second = second.as_any().downcast_ref::<Int64Array>().unwrap();
-
-        assert_eq!(first.values(), &[10, 20, 30]);
-        assert_eq!(second.values(), &[10, 20, 30, 40, 50]);
+        // second snapshot was taken after two writes: two separate per-commit arrays
+        let mut second_iter = second.iter();
+        let second_a = second_iter
+            .next()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let second_b = second_iter
+            .next()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(second_iter.next().is_none());
+        assert_eq!(second_a.values(), &[10, 20, 30]);
+        assert_eq!(second_b.values(), &[40, 50]);
     }
 
     #[test]
@@ -388,16 +467,18 @@ mod tests {
 
         column.write_values::<i64>(&[10, 20, 30]).unwrap();
 
-        let snapshot = column
-            .read_mutable()
-            .expect("mutable tail should exist")
+        let snapshot = column.read_mutable().expect("mutable tail should exist");
+
+        // write_values commits one Arc per call into the buffer.
+        let mut arrays = snapshot.iter();
+        let array = arrays
+            .next()
+            .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
-            .expect("snapshot should be Int64Array")
-            .values()
-            .to_vec();
-
-        assert_eq!(snapshot, vec![10, 20, 30]);
+            .expect("snapshot should be Int64Array");
+        assert!(arrays.next().is_none());
+        assert_eq!(array.values(), &[10, 20, 30]);
     }
 
     #[test]
@@ -410,11 +491,34 @@ mod tests {
         column.write_values::<i64>(&[40, 50]).unwrap();
         let second = column.read_mutable().unwrap();
 
-        let first = first.as_any().downcast_ref::<Int64Array>().unwrap();
-        let second = second.as_any().downcast_ref::<Int64Array>().unwrap();
+        // first snapshot: one array [10, 20, 30]
+        let mut first_iter = first.iter();
+        let first_array = first_iter
+            .next()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(first_iter.next().is_none());
+        assert_eq!(first_array.values(), &[10, 20, 30]);
 
-        assert_eq!(first.values(), &[10, 20, 30]);
-        assert_eq!(second.values(), &[10, 20, 30, 40, 50]);
+        // second snapshot: two separate per-commit arrays
+        let mut second_iter = second.iter();
+        let second_a = second_iter
+            .next()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let second_b = second_iter
+            .next()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(second_iter.next().is_none());
+        assert_eq!(second_a.values(), &[10, 20, 30]);
+        assert_eq!(second_b.values(), &[40, 50]);
     }
 
     #[test]
