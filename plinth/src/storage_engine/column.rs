@@ -7,7 +7,7 @@ use crate::{
         units::VersionID,
         writer_buffer::WriteBufferSnapshot,
     },
-    writer_buffer::{CheckedBuilder, Full, Partial},
+    writer_buffer::{CheckedBuilder, ChunkBuffer, ExceedsChunkCapacity, Full, Partial},
 };
 
 #[derive(Debug)]
@@ -61,26 +61,20 @@ impl Column {
                 }
 
                 Err((builder, chunk_buffer, chunk_id)) => {
-                    // The builder plus previously committed arrays exactly fill CHUNK_SIZE.
-                    // Flush the full builder into the buffer and fuse into a frozen array.
-                    let checked: CheckedBuilder<<V as AppendableType>::Builder> =
-                        chunk_buffer.make_builder(builder).expect(
-                            "full builder must fit: chunk_buffer.size + builder.len == CHUNK_SIZE",
-                        );
-                    let Full { builder, array } = match chunk_buffer.append_from_builder(checked) {
-                        Err(values) => values,
-                        Ok(_) => unreachable!(
-                            "chunk_buffer.size + builder.len == CHUNK_SIZE, so append_from_builder must fuse"
+                    let resetted_builder: Box<V::Builder> = match self.fuse_and_publish::<V>(
+                        chunk_id,
+                        builder,
+                        chunk_buffer,
+                    ) {
+                        Ok(builder) => builder,
+                        Err(ExceedsChunkCapacity) => unreachable!(
+                            "Writer invariant violated: chunk capacity exceeded unexpectedly. Check ChunkWriter::append."
                         ),
                     };
-                    self.publish_frozen_chunk(array, chunk_id);
 
-                    match MutableChunk::new(builder, (self.next_version)()).get_writer::<V>() {
-                        Ok(res) => writer = res,
-                        Err(_) => unreachable!(
-                            "builder type invariant violated: newly created builder must resolve"
-                        ),
-                    }
+                    writer = MutableChunk::new(resetted_builder, (self.next_version)())
+                        .get_writer()
+                        .or(Err(InvalidDowncast))?;
                 }
             }
         }
@@ -90,6 +84,25 @@ impl Column {
         self.tail = Some(MutableChunk::from_raw(builder, chunk_buffer, chunk_id));
 
         Ok(())
+    }
+
+    fn fuse_and_publish<B: AppendableType + Send>(
+        &mut self,
+        chunk_id: VersionID,
+        builder: Box<B::Builder>,
+        buffer: ChunkBuffer,
+    ) -> Result<Box<B::Builder>, ExceedsChunkCapacity> {
+        let checked_builder: CheckedBuilder<B::Builder> = buffer.make_builder(builder)?;
+
+        match buffer.append_from_builder(checked_builder) {
+            Err(Full { array, builder }) => {
+                self.publish_frozen_chunk(array, chunk_id);
+                Ok(builder)
+            }
+            Ok(_) => unreachable!(
+                "chunk_buffer.size + builder.len == CHUNK_SIZE, so append_from_builder must fuse"
+            ),
+        }
     }
 
     pub(crate) fn write_values<B: AppendableType + Send>(
@@ -116,25 +129,21 @@ impl Column {
                     break;
                 }
                 Err((builder, chunk_buffer, chunk_id, remainder)) => {
-                    let checked = chunk_buffer.make_builder(builder).expect(
-                        "full builder must fit: chunk_buffer.size + builder.len == CHUNK_SIZE",
-                    );
-                    let Full { builder, array } = match chunk_buffer.append_from_builder(checked) {
-                        Err(values) => values,
-                        Ok(_) => unreachable!(
-                            "chunk_buffer.size + builder.len == CHUNK_SIZE, so append_from_builder must fuse"
+                    values = remainder;
+                    let resetted_builder: Box<B::Builder> = match self.fuse_and_publish::<B>(
+                        chunk_id,
+                        builder,
+                        chunk_buffer,
+                    ) {
+                        Ok(builder) => builder,
+                        Err(ExceedsChunkCapacity) => unreachable!(
+                            "Writer invariant violated: chunk capacity exceeded unexpectedly. Check ChunkWriter::append."
                         ),
                     };
-                    self.publish_frozen_chunk(array, chunk_id);
 
-                    values = remainder;
-
-                    match MutableChunk::new(builder, (self.next_version)()).get_writer::<B>() {
-                        Ok(res) => writer = res,
-                        Err(_) => unreachable!(
-                            "builder type invariant violated: newly created builder must resolve"
-                        ),
-                    }
+                    writer = MutableChunk::new(resetted_builder, (self.next_version)())
+                        .get_writer()
+                        .or(Err(InvalidDowncast))?;
                 }
             }
         }
