@@ -2,16 +2,15 @@ use arrow::array::{Array, ArrayBuilder};
 use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
+    shared::InvalidDowncast,
     storage_engine::{
-        chunk::{Append, AppendableType, ChunkWriter, FrozenChunk, MutableChunk},
+        chunk::{ChunkWriter, FrozenChunk, MutableChunk},
+        type_builder::{Append, AppendableType},
         units::VersionID,
         writer_buffer::WriteBufferSnapshot,
     },
     writer_buffer::{CheckedBuilder, ChunkBuffer, ExceedsChunkCapacity, Full, Partial},
 };
-
-#[derive(Debug)]
-pub struct InvalidDowncast;
 
 pub struct Column {
     head: Option<Arc<FrozenChunk>>,
@@ -230,7 +229,8 @@ mod tests {
     use arrow::array::{Array, Int64Array};
 
     use crate::storage_engine::{
-        chunk::{AppendableType, CHUNK_SIZE},
+        chunk::CHUNK_SIZE,
+        type_builder::AppendableType,
         column::{Column, InvalidDowncast},
         units::VersionID,
     };

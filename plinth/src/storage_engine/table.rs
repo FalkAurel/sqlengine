@@ -4,8 +4,9 @@ use crate::{
     row_index::RowIndex,
     row_state::{RowMetadata, RowState},
     storage_engine::{
-        chunk::{Append, AppendableType},
-        column::{Column, InvalidDowncast},
+        type_builder::{Append, AppendableType},
+        column::Column,
+        shared::InvalidDowncast,
         table::{
             schema::SchemaList,
             sealed::{Index, IndexNotFound},
@@ -506,7 +507,7 @@ pub trait SliceTableRow<const N: usize>: TableRow {
 }
 
 pub mod schema {
-    use crate::storage_engine::chunk::AppendableType;
+    use crate::storage_engine::type_builder::AppendableType;
 
     pub trait SchemaList {}
 
