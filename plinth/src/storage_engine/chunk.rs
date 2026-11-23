@@ -7,10 +7,10 @@ use std::{
 use arrow::array::{Array, ArrayBuilder};
 
 use crate::storage_engine::{
+    type_builder::{Append, AppendableType},
     units::{LogicalSize, VersionID},
     vector::VectorIter,
     writer_buffer::{ChunkBuffer, WriteBufferSnapshot},
-    type_builder::{Append, AppendableType}
 };
 
 #[cfg(not(miri))]
@@ -57,6 +57,59 @@ impl FrozenChunk {
 
     pub(crate) fn set_next(&self, value: Arc<FrozenChunk>) -> Result<(), Arc<FrozenChunk>> {
         self.next.set(value)
+    }
+}
+
+// Iteratively destroys the linked `FrozenChunk` chain to prevent stack overflow.
+//
+// A column containing billions of elements can consist of tens of thousands
+// of chunks. Since each chunk owns its successor through an `Arc`, recursively
+// dropping the chain could exhaust the thread's stack.
+//
+// Recursive destruction:
+//
+//
+//   A ──drop──> B ──drop──> C ──drop──> D ──drop──> ...
+//   │           │           │           │
+//   ▼           ▼           ▼           ▼
+//  stack       stack       stack       stack
+//  frame       frame       frame       frame
+//
+//
+// Iterative destruction:
+//
+//
+//   A       B       C       D
+//   │       │       │       │
+//   ▼       ▼       ▼       ▼
+//  take    take    take    take
+//  next    next    next    next
+//   │       │       │       │
+//   ▼       ▼       ▼       ▼
+//  drop    drop    drop    drop
+//
+//   └───────┴───────┴───────┘
+//       Same stack frame
+//
+//
+// `Arc::try_unwrap` allows us to take ownership of exclusively owned chunks,
+// detach their successors, and destroy them one at a time without recursion.
+impl Drop for FrozenChunk {
+    fn drop(&mut self) {
+        let mut next: Option<Arc<FrozenChunk>> = self.next.take();
+
+        while let Some(chunk) = next {
+            match Arc::try_unwrap(chunk) {
+                Ok(mut chunk) => {
+                    next = chunk.next.take();
+                    drop(chunk);
+                }
+                Err(chunk) => {
+                    drop(chunk);
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -254,8 +307,6 @@ impl<B: AppendableType> ChunkWriter<B> {
         (self.builder, self.chunk_buffer, self.chunk_id)
     }
 }
-
-
 
 #[cfg(test)]
 mod test {

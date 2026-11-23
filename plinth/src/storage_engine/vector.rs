@@ -2,9 +2,12 @@ use std::ops::Range;
 
 use arrow::array::{Array, ArrowPrimitiveType, PrimitiveArray};
 
-use crate::storage_engine::{
-    units::{LogicalOffset, LogicalSize},
-    vector::sealed::Windowed,
+use crate::{
+    chunk::CHUNK_SIZE,
+    storage_engine::{
+        units::{LogicalOffset, LogicalSize},
+        vector::sealed::Windowed,
+    },
 };
 
 pub(crate) const VECTOR_SIZE: LogicalSize = LogicalSize::new(1024);
@@ -13,6 +16,7 @@ pub(crate) const VECTOR_SIZE: LogicalSize = LogicalSize::new(1024);
 ///
 /// There is deliberately no `dyn Array` here.
 /// The concrete array type has already been resolved by `ChunkView`.
+#[derive(Debug)]
 pub struct Vector<'a, A: Array> {
     data: &'a A,
     range: Range<LogicalOffset>,
@@ -35,6 +39,10 @@ impl<'a, A: Array + sealed::Windowed> Vector<'a, A> {
     where
         F: FnOnce(&<A as sealed::Windowed>::Window, Validity<'_, A>) -> R,
     {
+        if self.data.len() > CHUNK_SIZE.as_usize() {
+            assert!(self.data.len() <= CHUNK_SIZE.as_usize());
+        }
+
         f(
             self.data.window(&self.range),
             Validity {

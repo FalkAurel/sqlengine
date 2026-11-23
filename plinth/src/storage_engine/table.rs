@@ -4,13 +4,13 @@ use crate::{
     row_index::RowIndex,
     row_state::{RowMetadata, RowState},
     storage_engine::{
-        type_builder::{Append, AppendableType},
         column::Column,
         shared::InvalidDowncast,
         table::{
             schema::SchemaList,
             sealed::{Index, IndexNotFound},
         },
+        type_builder::{Append, AppendableType},
         units::{LogicalOffset, VersionID},
     },
     units::LogicalSize,

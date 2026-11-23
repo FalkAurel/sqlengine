@@ -5,7 +5,10 @@ use arrow::{
     compute::concat,
 };
 
-use crate::storage_engine::{chunk::CHUNK_SIZE, units::LogicalSize, vector::VectorIter};
+use crate::{
+    shared::InvalidDowncast,
+    storage_engine::{chunk::CHUNK_SIZE, units::LogicalSize, vector::VectorIter},
+};
 
 /// Per-transaction staging buffer for a `MutableChunk`.
 ///
@@ -152,14 +155,30 @@ impl WriteBufferSnapshot {
         self.0.iter()
     }
 
-    /// Yield one `VectorIter<A>` per committed array, zero-copy.
+    /// Yield one zero-copy `VectorIter<A>` per committed array.
     ///
-    /// Arrays that don't downcast to `A` are silently skipped (this should not
-    /// happen in practice because all arrays in a chunk come from the same builder).
-    pub(crate) fn vectors<A: Array + 'static>(&self) -> impl Iterator<Item = VectorIter<'_, A>> {
-        self.0
+    /// Returns `InvalidDowncast` if any array cannot be downcast to `A`.
+    /// All arrays are validated upfront, while the iterators are constructed
+    /// lazily. A failed downcast should not happen in practice because all
+    /// arrays in a chunk come from the same builder.
+    pub(crate) fn vectors<A: Array + 'static>(
+        &self,
+    ) -> Result<impl Iterator<Item = VectorIter<'_, A>>, InvalidDowncast> {
+        if self
+            .0
             .iter()
-            .filter_map(|arc| arc.as_any().downcast_ref::<A>().map(VectorIter::new))
+            .any(|arc| arc.as_any().downcast_ref::<A>().is_none())
+        {
+            return Err(InvalidDowncast);
+        }
+
+        Ok(self.0.iter().map(|arc| {
+            VectorIter::new(
+                arc.as_any()
+                    .downcast_ref::<A>()
+                    .expect("Validation has already happened"),
+            )
+        }))
     }
 }
 

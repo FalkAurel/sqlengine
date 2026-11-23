@@ -3,6 +3,7 @@ use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
     shared::InvalidDowncast,
+    snapshot::Snapshot,
     storage_engine::{
         chunk::{ChunkWriter, FrozenChunk, MutableChunk},
         type_builder::{Append, AppendableType},
@@ -154,6 +155,14 @@ impl Column {
         Ok(())
     }
 
+    pub(crate) fn snapshot(&mut self) -> Snapshot {
+        Snapshot::new(
+            self.read_frozen(),
+            self.read_mutable()
+                .expect("This should not be possible since we are `!Sync`"),
+        )
+    }
+
     /// Returns the oldest frozen chunk, or `None` if no chunks have been frozen.
     pub(crate) fn read_frozen(&self) -> Option<Arc<FrozenChunk>> {
         self.head.clone()
@@ -230,8 +239,8 @@ mod tests {
 
     use crate::storage_engine::{
         chunk::CHUNK_SIZE,
-        type_builder::AppendableType,
         column::{Column, InvalidDowncast},
+        type_builder::AppendableType,
         units::VersionID,
     };
 
