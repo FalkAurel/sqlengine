@@ -109,20 +109,25 @@ mod tests {
         assert_eq!(cum_sum, n * (n + 1) / 2);
     }
 
-
     /// Verifies that repeated snapshot scans over a 32 GiB (`1..=u32::MAX`) column
     /// produce an exact, consistent sum across 1,000 iterations (~32 TiB of reads).
     ///
-    /// # Verification & Hardware Fault Note
+    /// # Verification 
     /// - **AddressSanitizer (`-Zsanitizer=address`):** Passed 975 consecutive full 32 GiB
     ///   passes with zero out-of-bounds accesses, use-after-free errors, or memory leaks.
     /// - **Miri (`cargo +nightly miri test`):** Passed multi-chunk execution (`n = 150_000`)
     ///   with zero uninitialized memory reads, alignment issues, or aliasing UB.
-    /// - **Known Hardware Defect on Dev Machine:** On iteration 975, `summe` jumped by
-    ///   `+70_368_744_177_664` (`1 << 46` / `0x0000_4000_0000_0000`). `memtester 32G 1`
-    ///   independently reproduced the exact same single-bit flip (`0x9191d19191919191 !=
-    ///   0x9191919191919191`, XOR diff `1 << 46`) during `Block Sequential`, confirming
-    ///   a faulty non-ECC DDR4 DIMM cell rather than a single-threaded software bug.
+    ///
+    /// # Known Hardware Defect on Dev Machine (`julius-H6109D4G`)
+    /// - On iteration 975, `summe` jumped by `+70_368_744_177_664` (`1 << 46` /
+    ///   `0x0000_4000_0000_0000`).
+    /// - A full `memtester 32G 1` (v4.7.1) pass independently reproduced three stuck-high
+    ///   single-bit flips across non-ECC DDR4 memory, confirming a faulty DIMM rather than
+    ///   a software bug:
+    ///   - `Block Sequential`: `0x9191d19191919191 != 0x9191919191919191` at `0x00000000efb4cec8` (XOR `1 << 46`)
+    ///   - `Walking Zeroes`: `0x0000200000080000 != 0x0000000000080000` at `0x000000039f0d3008` (XOR `1 << 45`)
+    ///   - `Walking Zeroes`: `0x0000400000080000 != 0x0000000000080000` at `0x000000039f0d6cc8` (XOR `1 << 46`)
+
     #[test]
     fn synchronous_snapshot_is_consistent() {
         let (n, iterations) = if cfg!(miri) {
@@ -152,6 +157,58 @@ mod tests {
                 .sum::<u64>();
 
             assert_eq!(summe, n * (n + 1) / 2);
+            println!(
+                "Iteration {iteration} / {iterations} ({}%)",
+                (iteration as f64 / iterations as f64) * 100f64
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_snapshot_is_consistent() {
+        let (n, iterations, num_threads) = if cfg!(miri) {
+            (150_000, 10, 2)
+        } else {
+            (
+                u32::MAX as u64,
+                1_000,
+                std::thread::available_parallelism()
+                    .map(|core| core.get())
+                    .unwrap(),
+            )
+        };
+
+        let iterator: RangeInclusive<u64> = 1..=n;
+        let mut column: Column = column::<u64>();
+
+        column.write::<u64>(iterator).unwrap();
+
+        use rayon::prelude::*;
+        let pool: rayon::ThreadPool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .unwrap();
+
+        for iteration in 1..=iterations {
+            let summe: u64 = pool.install(|| {
+                column
+                    .snapshot()
+                    .par_bridge()
+                    .map(|node| {
+                        node.vectors::<u64>()
+                            .unwrap()
+                            .map(|vector| {
+                                vector
+                                    .map(|window| window.with(|window, _| window.iter().sum()))
+                                    .sum()
+                            })
+                            .sum()
+                    })
+                    .sum()
+            });
+
+            assert_eq!(summe, n(n + 1) / 2);
+
             println!(
                 "Iteration {iteration} / {iterations} ({}%)",
                 (iteration as f64 / iterations as f64) * 100f64
