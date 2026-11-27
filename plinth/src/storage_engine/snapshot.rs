@@ -55,20 +55,13 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        cell::OnceCell,
-        ops::{Range, RangeInclusive},
-        thread::JoinHandle,
-        time::Instant,
-    };
+    use std::ops::{Range, RangeInclusive};
 
     use crate::{
         AppendableType,
         column::Column,
         shared::InvalidDowncast,
-        snapshot::Node,
         units::{LogicalOffset, VersionID},
-        vector::Validity,
     };
 
     fn column<V: AppendableType>() -> Column {
@@ -112,7 +105,7 @@ mod tests {
     /// Verifies that repeated snapshot scans over a 32 GiB (`1..=u32::MAX`) column
     /// produce an exact, consistent sum across 1,000 iterations (~32 TiB of reads).
     ///
-    /// # Verification 
+    /// # Verification
     /// - **AddressSanitizer (`-Zsanitizer=address`):** Passed 975 consecutive full 32 GiB
     ///   passes with zero out-of-bounds accesses, use-after-free errors, or memory leaks.
     /// - **Miri (`cargo +nightly miri test`):** Passed multi-chunk execution (`n = 150_000`)
@@ -127,7 +120,6 @@ mod tests {
     ///   - `Block Sequential`: `0x9191d19191919191 != 0x9191919191919191` at `0x00000000efb4cec8` (XOR `1 << 46`)
     ///   - `Walking Zeroes`: `0x0000200000080000 != 0x0000000000080000` at `0x000000039f0d3008` (XOR `1 << 45`)
     ///   - `Walking Zeroes`: `0x0000400000080000 != 0x0000000000080000` at `0x000000039f0d6cc8` (XOR `1 << 46`)
-
     #[test]
     fn synchronous_snapshot_is_consistent() {
         let (n, iterations) = if cfg!(miri) {
@@ -166,11 +158,13 @@ mod tests {
 
     #[test]
     fn parallel_snapshot_is_consistent() {
+        const TEST_ELEMENTS: u64 = 1 << 28; // TSan eats my System-Memory :( Feel free to adjust this as needed
+
         let (n, iterations, num_threads) = if cfg!(miri) {
             (150_000, 10, 2)
         } else {
             (
-                u32::MAX as u64,
+                TEST_ELEMENTS,
                 1_000,
                 std::thread::available_parallelism()
                     .map(|core| core.get())
@@ -199,15 +193,17 @@ mod tests {
                             .unwrap()
                             .map(|vector| {
                                 vector
-                                    .map(|window| window.with(|window, _| window.iter().sum()))
-                                    .sum()
+                                    .map(|window| {
+                                        window.with(|window, _| window.iter().sum::<u64>())
+                                    })
+                                    .sum::<u64>()
                             })
-                            .sum()
+                            .sum::<u64>()
                     })
                     .sum()
             });
 
-            assert_eq!(summe, n(n + 1) / 2);
+            assert_eq!(summe, n * (n + 1) / 2);
 
             println!(
                 "Iteration {iteration} / {iterations} ({}%)",
